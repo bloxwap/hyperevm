@@ -1,0 +1,27 @@
+{
+  "name": "@bloxwap/hyperevm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Performance-optimized, load-balanced RPC transport for HyperEVM. A drop-in upgrade over viem's fallback transport.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "keywords": ["hyperevm", "hyperliquid", "rpc", "viem", "transport", "load-balancer", "fallback", "evm", "typescript"],
+  "homepage": "https://github.com/bloxwap/hyperevm#readme",
+  "bugs": { "url": "https://github.com/bloxwap/hyperevm/issues" },
+  "repository": { "type": "git", "url": "git+https://github.com/bloxwap/hyperevm.git" },
+  "engines": { "node": ">=22.12.0" },
+  "exports": {
+    ".": "./src/mod.ts"
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
