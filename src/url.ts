@@ -40,3 +40,20 @@ export function normalizeRpcUrl(url: string): NormalizedRpcUrl {
     kind: websocket ? "websocket" : "http",
   };
 }
+
+const WANCHAIN_HOST = "wandevs.org";
+
+/**
+ * True when `url`'s hostname is `wandevs.org` or a subdomain of it.
+ * Chain id 999 on ethereum-lists is Wanchain Testnet, which serves that host.
+ * The hostname is parsed, so a path or a lookalike domain does not match.
+ */
+export function isWanchainHost(url: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return hostname === WANCHAIN_HOST || hostname.endsWith(`.${WANCHAIN_HOST}`);
+}

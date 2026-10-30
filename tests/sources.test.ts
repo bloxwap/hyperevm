@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { normalizeRpcUrl } from "../src/url.ts";
+import { isWanchainHost, normalizeRpcUrl } from "../src/url.ts";
 import {
   extractObjectBlock,
   parseChainlistChainFile,
@@ -34,6 +34,26 @@ describe("source parsers", () => {
   test("ignores a chain 999 file that is not HyperEVM", () => {
     const source = `{ "name": "Wanchain Testnet", "chainId": 999, "rpc": ["https://gwan-ssl.wandevs.org:46891/"] }`;
     expect(parseChainlistChainFile(source, CHAIN_URL)).toEqual([]);
+  });
+
+  test("drops wandevs.org hosts and keeps urls that only contain that text", () => {
+    const source = `
+      { "name": "HyperEVM", "chainId": 999, "rpc": [
+        "https://rpc.hyperliquid.xyz/evm",
+        "https://gwan-ssl.wandevs.org:46891/",
+        "https://Wandevs.org/evm",
+        "wss://rpc.wandevs.org/ws",
+        "https://notwandevs.org/evm",
+        "https://wandevs.org.evil.example/evm",
+        "https://rpc.example/wandevs.org"
+      ]}
+    `;
+    expect(parseChainlistChainFile(source, CHAIN_URL).map((endpoint) => endpoint.url)).toEqual([
+      "https://rpc.hyperliquid.xyz/evm",
+      "https://notwandevs.org/evm",
+      "https://wandevs.org.evil.example/evm",
+      "https://rpc.example/wandevs.org",
+    ]);
   });
 
   test("reads only the 999 block of extraRpcs and keeps the tracking field", () => {
@@ -83,5 +103,18 @@ describe("normalizeRpcUrl", () => {
     expect(() => normalizeRpcUrl("https://user:pass@rpc.example/evm")).toThrow(/credentials/);
     expect(() => normalizeRpcUrl("https://rpc.example/evm?key=1")).toThrow(/query/);
     expect(() => normalizeRpcUrl("ftp://rpc.example/evm")).toThrow(/http/);
+  });
+});
+
+describe("isWanchainHost", () => {
+  test("matches the hostname exactly or as a subdomain", () => {
+    expect(isWanchainHost("https://wandevs.org/evm")).toBe(true);
+    expect(isWanchainHost("https://Wandevs.org:46891/")).toBe(true);
+    expect(isWanchainHost("wss://gwan-ssl.wandevs.org:46891/")).toBe(true);
+    expect(isWanchainHost("https://notwandevs.org/evm")).toBe(false);
+    expect(isWanchainHost("https://wandevs.org.evil.example/evm")).toBe(false);
+    expect(isWanchainHost("https://rpc.example/wandevs.org")).toBe(false);
+    expect(isWanchainHost("https://rpc.example/evm?host=wandevs.org")).toBe(false);
+    expect(isWanchainHost("not a url")).toBe(false);
   });
 });
