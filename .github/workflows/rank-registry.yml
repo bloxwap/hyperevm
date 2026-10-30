@@ -1,0 +1,54 @@
+name: Rank registry
+
+# Probes the public HyperEVM list and opens a pull request. It does not push
+# to main. Without RANK_REGISTRY_TOKEN, GitHub's default token opens the PR
+# but will not itself trigger CI on that PR.
+
+on:
+  schedule:
+    - cron: "17 16 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: rank-registry
+  cancel-in-progress: false
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Probe and rank
+        run: bun run rank
+
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          token: ${{ secrets.RANK_REGISTRY_TOKEN || github.token }}
+          commit-message: "chore: refresh HyperEVM RPC rankings"
+          title: "chore: refresh HyperEVM RPC rankings"
+          body: |
+            Weekly probe of the public HyperEVM registry.
+
+            The ranker merges the current upstream lists with community submissions, probes each HTTP endpoint, and rewrites `registry/nodes.json` plus `registry/history.json`. Nodes without three successful probes spread across two weeks stay on the new-node weight cap.
+
+            This pull request was opened by `.github/workflows/rank-registry.yml`. It does not push to `main`.
+          branch: registry/rankings
+          add-paths: |
+            registry/nodes.json
+            registry/history.json
+          delete-branch: true

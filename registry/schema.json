@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bloxwap/hyperevm/blob/main/registry/schema.json",
+  "title": "HyperEVM public RPC registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "chainId", "updatedAt", "policy", "endpoints"],
+  "properties": {
+    "version": { "const": 1 },
+    "chainId": { "const": 999 },
+    "updatedAt": { "type": "string", "format": "date-time" },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "windowMs",
+        "minObservations",
+        "minSpanMs",
+        "minUptime",
+        "minEligibleUptime",
+        "newNodeWeightCap",
+        "maxNewNodeShare"
+      ],
+      "properties": {
+        "windowMs": { "type": "number", "exclusiveMinimum": 0 },
+        "minObservations": { "type": "integer", "minimum": 1 },
+        "minSpanMs": { "type": "number", "minimum": 0 },
+        "minUptime": { "type": "number", "minimum": 0, "maximum": 1 },
+        "minEligibleUptime": { "type": "number", "minimum": 0, "maximum": 1 },
+        "newNodeWeightCap": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "maxNewNodeShare": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
+      }
+    },
+    "endpoints": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/endpoint" }
+    }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "url"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "stats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observations", "successes", "uptime", "latencyMs", "tailMs", "medianLag", "established"],
+      "properties": {
+        "observations": { "type": "number", "minimum": 0 },
+        "successes": { "type": "number", "minimum": 0 },
+        "uptime": { "type": "number", "minimum": 0, "maximum": 1 },
+        "latencyMs": { "type": ["number", "null"] },
+        "tailMs": { "type": ["number", "null"] },
+        "medianLag": { "type": ["number", "null"] },
+        "established": { "type": "boolean" }
+      }
+    },
+    "endpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "kind",
+        "tracking",
+        "sources",
+        "submission",
+        "addedAt",
+        "eligible",
+        "weight",
+        "rank",
+        "stats"
+      ],
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["http", "websocket"] },
+        "tracking": { "enum": ["none", "limited", "yes", "unknown"] },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/source" }
+        },
+        "submission": { "enum": ["upstream", "community"] },
+        "addedAt": { "type": "string", "format": "date-time" },
+        "eligible": { "type": "boolean" },
+        "weight": { "type": "number", "minimum": 0 },
+        "rank": { "type": ["integer", "null"], "minimum": 1 },
+        "stats": { "anyOf": [{ "$ref": "#/$defs/stats" }, { "type": "null" }] }
+      }
+    }
+  }
+}
