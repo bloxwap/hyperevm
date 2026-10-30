@@ -78,7 +78,7 @@ The ranker reads only these documents:
 
 URLs with a query string, a username, or a hash are rejected. `http://` is rejected. Anything whose URL contains `testnet` is rejected.
 
-**ethereum-lists `eip155-999.json` is not a source.** That file is Wanchain Testnet, which reused chain id 999. The parser and the registry check both refuse `wandevs.org`.
+**ethereum-lists `eip155-999.json` is not a source.** That file is Wanchain Testnet, which reused chain id 999. The parser and the registry check both refuse a hostname of `wandevs.org` or a subdomain of it.
 
 ## Gaps
 

@@ -43,3 +43,45 @@ describe("shipped registry", () => {
     );
   });
 });
+
+describe("assertRegistryFile", () => {
+  test("rejects a wandevs.org hostname and accepts a lookalike", () => {
+    expect(() => assertRegistryFile(registryFile("https://gwan-ssl.wandevs.org:46891/"))).toThrow(/Wanchain/);
+    expect(() => assertRegistryFile(registryFile("https://wandevs.org/evm"))).toThrow(/Wanchain/);
+    expect(() => assertRegistryFile(registryFile("wss://rpc.wandevs.org/"))).toThrow(/Wanchain/);
+    expect(() => assertRegistryFile(registryFile("https://notwandevs.org/evm"))).not.toThrow();
+    expect(() => assertRegistryFile(registryFile("https://wandevs.org.evil.example/evm"))).not.toThrow();
+    expect(() => assertRegistryFile(registryFile("https://rpc.example/wandevs.org"))).not.toThrow();
+  });
+});
+
+function registryFile(url: string): unknown {
+  return {
+    version: 1,
+    chainId: 999,
+    updatedAt: "2026-10-30T00:00:00.000Z",
+    policy: {
+      windowMs: 1,
+      minObservations: 1,
+      minSpanMs: 1,
+      minUptime: 0.8,
+      minEligibleUptime: 0.5,
+      newNodeWeightCap: 0.15,
+      maxNewNodeShare: 0.25,
+    },
+    endpoints: [
+      {
+        url,
+        kind: url.startsWith("wss:") ? "websocket" : "http",
+        tracking: "unknown",
+        sources: [{ name: "chainlist", url: "https://example.test/chain" }],
+        submission: "upstream",
+        addedAt: "2026-10-30T00:00:00.000Z",
+        eligible: false,
+        weight: 0,
+        rank: null,
+        stats: null,
+      },
+    ],
+  };
+}

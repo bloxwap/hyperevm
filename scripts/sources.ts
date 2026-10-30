@@ -5,7 +5,7 @@
  */
 
 import type { RegistryEndpointInput, RegistrySource, Tracking } from "../src/policy.ts";
-import { normalizeRpcUrl } from "../src/url.ts";
+import { isWanchainHost, normalizeRpcUrl } from "../src/url.ts";
 
 export const SOURCE_URLS = {
   chainlistChain:
@@ -173,7 +173,7 @@ function acceptUrl(raw: string, rpcLikeOnly: boolean): { url: string; kind: "htt
   if (normalized.kind === "http" && !normalized.url.startsWith("https:")) return undefined;
   if (normalized.kind === "websocket" && !normalized.url.startsWith("wss:")) return undefined;
   if (normalized.url.toLowerCase().includes("testnet")) return undefined;
-  if (normalized.url.includes("wandevs.org")) return undefined;
+  if (isWanchainHost(normalized.url)) return undefined;
   if (rpcLikeOnly && !isRpcLike(normalized.url)) return undefined;
   return normalized;
 }

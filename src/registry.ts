@@ -13,6 +13,7 @@ import {
   type Tracking,
   defaultRankPolicy,
 } from "./policy.ts";
+import { isWanchainHost } from "./url.ts";
 
 /** On-disk registry document. Version 1 is the only shape this package reads. */
 export interface RegistryFile {
@@ -132,7 +133,7 @@ export function assertRegistryFile(value: unknown): asserts value is RegistryFil
   for (const endpoint of endpoints) {
     if (urls.has(endpoint.url)) throw new Error(`Registry lists ${endpoint.url} more than once.`);
     urls.add(endpoint.url);
-    if (endpoint.url.includes("wandevs.org")) {
+    if (isWanchainHost(endpoint.url)) {
       throw new Error("Registry must not include the Wanchain endpoint that shares chain id 999.");
     }
   }
