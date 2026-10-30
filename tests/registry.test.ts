@@ -1,0 +1,45 @@
+import { describe, expect, test } from "bun:test";
+
+import { readFileSync } from "node:fs";
+
+import { assertRegistryFile, defaultRegistry, registryHttpEndpoints } from "../src/registry.ts";
+import { normalizeRpcUrl } from "../src/url.ts";
+
+describe("shipped registry", () => {
+  test("matches the schema invariants and the HTTP pool", () => {
+    const text = readFileSync(new URL("../registry/nodes.json", import.meta.url), "utf8");
+    const parsed: unknown = JSON.parse(text);
+    assertRegistryFile(parsed);
+    expect(defaultRegistry.chainId).toBe(999);
+    expect(defaultRegistry.version).toBe(1);
+    expect(defaultRegistry.endpoints.length).toBeGreaterThan(0);
+
+    const urls = new Set<string>();
+    const ranks: number[] = [];
+    for (const endpoint of defaultRegistry.endpoints) {
+      expect(urls.has(endpoint.url)).toBe(false);
+      urls.add(endpoint.url);
+      expect(endpoint.url).not.toContain("wandevs.org");
+      expect(endpoint.url).not.toContain("testnet");
+      expect(endpoint.sources.length).toBeGreaterThan(0);
+      const normalized = normalizeRpcUrl(endpoint.url);
+      expect(normalized.url).toBe(endpoint.url);
+      expect(normalized.kind).toBe(endpoint.kind);
+      if (endpoint.kind === "http") expect(endpoint.url.startsWith("https:")).toBe(true);
+      if (endpoint.eligible) {
+        expect(endpoint.weight).toBeGreaterThan(0);
+        expect(endpoint.rank).toBeGreaterThan(0);
+        if (endpoint.rank !== null) ranks.push(endpoint.rank);
+      } else {
+        expect(endpoint.weight).toBe(0);
+        expect(endpoint.rank).toBeNull();
+      }
+    }
+    expect(ranks.sort((a, b) => a - b)).toEqual(ranks.map((_, index) => index + 1));
+    expect(registryHttpEndpoints().map((endpoint) => endpoint.url)).toEqual(
+      defaultRegistry.endpoints
+        .filter((endpoint) => endpoint.kind === "http" && endpoint.eligible)
+        .map((endpoint) => endpoint.url),
+    );
+  });
+});
