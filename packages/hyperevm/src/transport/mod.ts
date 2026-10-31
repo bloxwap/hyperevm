@@ -88,7 +88,7 @@ const DEFAULT_CHAIN_ID = 999;
 /** First backoff before re-trying endpoints that already failed this call, when `retryDelay` is 0. */
 const DEFAULT_RETRY_BACKOFF_MS = 100;
 
-/** Longest wait before a re-try. A call stops instead of waiting out a longer ejection. */
+/** Longest backoff before a re-try, and the most one call waits out ejections in total. Past it, the call stops. */
 const MAX_RETRY_BACKOFF_MS = 2_000;
 
 /** How long past its deadline an attempt still counts as in flight, in case its own cleanup was dropped. */
@@ -566,8 +566,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
      * to true when it failed. The caller then picks again, so a verified pick is always synchronous and concurrent
      * calls see each other's in-flight counts: cold calls that all waited on one check spread out afterwards.
      * A failed check excludes the endpoint for this call and its reason joins `errors`, so it never costs an attempt.
-     * With `skipEjected`, an ejected pick yields undefined before any check. The caller sets it on a failover and
-     * after a failed check, so a storm costs one check per call.
+     * With `skipEjected`, an ejected pick yields undefined before any check. The caller sets it unless the
+     * availability exception applies.
      */
     const pickVerified = (
       method: string,
@@ -706,51 +706,58 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       const errors: Error[] = [];
       const retries = idempotent || rebroadcast;
       const attempts = retries ? retryCount + 1 : 1;
+      // The availability exception: when every candidate is ejected before the first attempt, that attempt may
+      // still use one. Nothing else is ever dispatched to an endpoint ejected at dispatch time.
+      const opening = board.pick(method, exclude, "best", random);
+      const lastResort = opening !== undefined && breaker.isOpen(opening.id);
       let previous: RankedEndpoint | undefined;
       let round = 0;
+      let ejectionWaitMs = 0;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
         let wait = attempt > 0 ? retryDelay : 0;
         let mode = attempt === 0 ? routing : "best";
+        let allowEjected = attempt === 0 && lastResort;
+        let newRound = false;
         let endpoint: RankedEndpoint | undefined;
+        // Every await below (chain check, retryDelay, backoff, ejection wait) is followed by a fresh pick, so
+        // the breaker is judged as it is at dispatch. The pick that returns is synchronous, so `start()` counts
+        // it in flight before any other call picks.
         for (;;) {
-          for (let backedOff = false; ; ) {
-            // Waiting out a chain check is followed by a fresh pick. The last pick is synchronous, so
-            // `start()` counts it in flight before any other call picks.
-            // Failing over into an ejected endpoint amplifies an outage, and checking its chain costs up to a
-            // timeout during its cooldown. A new round goes back to the endpoints that failed once instead,
-            // and stops if only ejected ones are left. A first attempt still takes an ejected endpoint
-            // when every candidate is ejected.
-            let skipEjected = attempt > 0 && !backedOff;
-            let picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
-            while (picked instanceof Promise) {
-              skipEjected = (await picked) || skipEjected;
-              picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
-            }
+          const picked = pickVerified(method, exclude, mode, parent, errors, !allowEjected);
+          if (picked instanceof Promise) {
+            // After a failed check an ejected endpoint is not checked next, so a storm costs one check per call.
+            if (await picked) allowEjected = false;
+            continue;
+          }
+          if (picked && wait > 0) {
+            await delay(wait, parent);
+            wait = 0;
+            continue;
+          }
+          if (picked) {
             endpoint = picked;
-            if (endpoint || backedOff || exclude.size === 0) break;
-            // Every usable endpoint failed this call, or failed its chain check. Start another round after a backoff.
+            break;
+          }
+          if (exclude.size > 0 && !newRound) {
+            // Every usable endpoint failed this call, or failed its chain check. Go back to them after a backoff.
             exclude.clear();
+            // Stop now when the round could only wait out a longer ejection. The pick after the wait checks again.
             const candidate = board.pick(method, exclude, "best", random);
-            if (!candidate) break;
-            const ejectedMs = breaker.remaining(candidate.id);
-            if (ejectedMs > MAX_RETRY_BACKOFF_MS) break;
-            await delay(Math.max(backoffMs(round, retryBackoff, random), ejectedMs), parent);
-            // A concurrent call may eject the endpoint during the wait. Judge it as it is now, so the re-try does not
-            // land in a fresh cooldown and end it early. The same 2 second rule applies.
-            const revisit = board.pick(method, exclude, "best", random);
-            const leftMs = revisit ? breaker.remaining(revisit.id) : 0;
-            if (!revisit || leftMs > MAX_RETRY_BACKOFF_MS) break;
-            if (leftMs > 0 && ejectedMs === 0) await delay(leftMs, parent);
+            if (!candidate || ejectionWaitMs + breaker.remaining(candidate.id) > MAX_RETRY_BACKOFF_MS) break;
+            await delay(backoffMs(round, retryBackoff, random), parent);
             round += 1;
             wait = 0;
             mode = "best";
-            backedOff = true;
+            newRound = true;
+            continue;
           }
-          if (!endpoint || wait === 0) break;
-          // A concurrent call may eject the pick while this one waits out `retryDelay`. Pick again if it did.
-          await delay(wait, parent);
-          wait = 0;
-          if (!breaker.isOpen(endpoint.id)) break;
+          // Only ejected endpoints are left. Wait for the best one while the call's 2 second budget allows,
+          // else stop with the last error rather than send into the cooldown.
+          const candidate = board.pick(method, exclude, "best", random);
+          const leftMs = candidate ? breaker.remaining(candidate.id) : 0;
+          if (leftMs <= 0 || ejectionWaitMs + leftMs > MAX_RETRY_BACKOFF_MS) break;
+          ejectionWaitMs += leftMs;
+          await delay(leftMs, parent);
         }
         if (!endpoint) break;
         exclude.add(endpoint.id);

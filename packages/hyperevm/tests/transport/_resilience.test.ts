@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { createTransport, keccak256, type EIP1193Parameters, type EIP1193RequestFn, type Transport } from "viem";
 
-import { hyperevm, type HyperevmEvent, type HyperevmTransportOptions } from "../../src/transport/mod.ts";
+import {
+  hyperevm,
+  type HyperevmEndpointConfig,
+  type HyperevmEvent,
+  type HyperevmTransportOptions,
+} from "../../src/transport/mod.ts";
 
 interface RpcBody {
   id: number;
@@ -560,6 +565,192 @@ describe("backoff rounds", () => {
     expect(rpc.calls.map((call) => call.method)).toEqual(["eth_chainId", "eth_call", "eth_getBalance"]);
     expect(events.some((event) => event.type === "restore")).toBe(false);
     client.value?.close();
+  });
+
+  test("a cooldown extended during a short ejection wait is not retried into", async () => {
+    const events: HyperevmEvent[] = [];
+    let limits = 0;
+    const rpc = mockFetch((_url, body) => {
+      if (body.method === "eth_chainId") return { result: "0x3e7" };
+      if (body.method === "eth_getBalance") {
+        limits += 1;
+        return { status: 429, headers: { "retry-after": limits === 1 ? "1" : "30" } };
+      }
+      const reads = rpc.calls.filter((call) => call.method === "eth_call").length;
+      return reads === 1 ? { status: 503 } : { result: "0x1" };
+    });
+    const client = hyperevm({
+      endpoints: [{ url: A, label: "a" }],
+      fetchFn: rpc.fetchFn,
+      headLag: { probeInterval: false },
+      onEvent: (event) => events.push(event),
+    })({});
+    // P gets a 503 and backs off. Q asks for 1 second, so P waits that out too.
+    const p = client.request({ method: "eth_call", params: [] }).then(
+      () => "served",
+      (error: unknown) => error,
+    );
+    await sleep(20);
+    // Q and R are not awaited here: each waits out its own cooldown before giving up.
+    const balance = (): Promise<unknown> =>
+      client.request({ method: "eth_getBalance", params: ["0x0", "latest"] }).catch((error: unknown) => error);
+    const q = balance();
+    // While P waits, R asks for 30 seconds.
+    await sleep(280);
+    const r = balance();
+    const outcome = await p;
+    expect(await q).toBeInstanceOf(Error);
+    expect(await r).toBeInstanceOf(Error);
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/Status: 503/);
+    expect(rpc.calls.map((call) => call.method)).toEqual([
+      "eth_chainId",
+      "eth_call",
+      "eth_getBalance",
+      "eth_getBalance",
+    ]);
+    expect(events.some((event) => event.type === "restore")).toBe(false);
+  });
+
+  /**
+   * One await point in the retry path. `victim` is the endpoint the call would retry on. A concurrent
+   * `eth_getBalance`, which only the victim serves, ejects it during that await at each of `limits`.
+   */
+  interface AwaitCase {
+    point: string;
+    options: Partial<HyperevmTransportOptions>;
+    /** Endpoints besides the victim. */
+    others: ("first" | "checker")[];
+    /** Milliseconds after the call starts, and the Retry-After the victim answers with then. */
+    limits: [number, string][];
+    /** Whether the victim fails the call's first read, so the call backs off on it. */
+    victimFailsFirst: boolean;
+    /** What the call resolves to. An Error when it must stop. */
+    expected: string | typeof Error;
+  }
+
+  const cases: AwaitCase[] = [
+    {
+      point: "retryDelay",
+      options: { retryDelay: 150 },
+      others: ["first"],
+      limits: [[30, "30"]],
+      victimFailsFirst: false,
+      expected: "0xfirst",
+    },
+    { point: "backoff", options: {}, others: [], limits: [[20, "30"]], victimFailsFirst: true, expected: Error },
+    {
+      point: "short ejection wait",
+      options: {},
+      others: [],
+      limits: [
+        [20, "0.5"],
+        [250, "30"],
+      ],
+      victimFailsFirst: true,
+      expected: Error,
+    },
+    {
+      point: "chain check",
+      options: { verifyChainId: true },
+      others: ["first", "checker"],
+      limits: [[30, "30"]],
+      victimFailsFirst: false,
+      expected: "0xfirst",
+    },
+  ];
+
+  test.each(cases)("no retry lands in a cooldown opened during the $point", async (item) => {
+    const events: HyperevmEvent[] = [];
+    const calls: string[] = [];
+    const answers = item.limits.map(([, retryAfter]) => retryAfter);
+    let victimReads = 0;
+    let firstReads = 0;
+    const node = (
+      name: string,
+      handler: (method: string) => unknown,
+      weight: number,
+      exclude: string[] = [],
+    ): HyperevmEndpointConfig => ({
+      label: name,
+      weight,
+      transport: () =>
+        createTransport({
+          key: name,
+          name,
+          type: "test",
+          retryCount: 0,
+          methods: { exclude },
+          request: (async ({ method }: EIP1193Parameters) => {
+            calls.push(`${name}:${method}`);
+            return handler(method);
+          }) as EIP1193RequestFn,
+        }),
+    });
+    const victim = node(
+      "victim",
+      (method) => {
+        if (method === "eth_chainId") return "0x3e7";
+        if (method === "eth_getBalance") {
+          const retryAfter = answers.shift();
+          if (retryAfter === undefined) return "0x0";
+          throw Object.assign(new Error("rate limited"), { headers: new Headers({ "retry-after": retryAfter }) });
+        }
+        victimReads += 1;
+        if (item.victimFailsFirst && victimReads === 1) throw new Error("socket hang up");
+        return "0xvictim";
+      },
+      1,
+    );
+    const first = node(
+      "first",
+      (method) => {
+        if (method === "eth_chainId") return "0x3e7";
+        firstReads += 1;
+        if (firstReads === 1) throw new Error("socket hang up");
+        return "0xfirst";
+      },
+      1_000,
+      ["eth_getBalance"],
+    );
+    // Preferred over the victim on failover. Its chain check is slow and fails.
+    const checker = node(
+      "checker",
+      async () => {
+        await sleep(80);
+        throw new Error("socket hang up");
+      },
+      100,
+      ["eth_getBalance"],
+    );
+    const others = { first, checker };
+    const client = open({
+      endpoints: [...item.others.map((name) => others[name]), victim],
+      onEvent: (event) => events.push(event),
+      ...item.options,
+    });
+    if (item.options.verifyChainId) {
+      // Verify the victim first, so the only check the call waits on is the checker's.
+      answers.unshift(undefined as unknown as string);
+      expect(await client.request({ method: "eth_getBalance", params: ["0x0", "latest"] })).toBe("0x0");
+    }
+    const before = calls.filter((call) => call === "victim:eth_call").length;
+    const call = client.request({ method: "eth_call", params: [] }).then(
+      (result) => result,
+      (error: unknown) => error,
+    );
+    for (const [at] of item.limits) {
+      setTimeout(() => {
+        void client.request({ method: "eth_getBalance", params: ["0x0", "latest"] }).catch(() => undefined);
+      }, at);
+    }
+    const outcome = await call;
+    if (item.expected === Error) expect(outcome).toBeInstanceOf(Error);
+    else expect(outcome).toBe(item.expected);
+    const reads = calls.filter((entry) => entry === "victim:eth_call").length - before;
+    expect(reads).toBe(item.victimFailsFirst ? 1 : 0);
+    expect(events.some((event) => event.type === "eject" && event.endpoint === "victim")).toBe(true);
+    expect(events.some((event) => event.type === "restore")).toBe(false);
   });
 });
 
