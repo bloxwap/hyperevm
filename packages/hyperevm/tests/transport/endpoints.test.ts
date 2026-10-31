@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   createPublicClient,
   createTransport,
+  HttpRequestError,
   http,
+  InvalidInputRpcError,
+  RpcRequestError,
   type EIP1193Parameters,
   type EIP1193RequestFn,
   type Transport,
@@ -79,7 +82,7 @@ function open(options: HyperevmTransportOptions, timeout = 1_000) {
   return hyperevm({ headLag: false, routing: "best", hedge: false, retryCount: 2, ...options })({ timeout });
 }
 
-/** Every string an error holds at any depth: its own properties, its causes, and nested objects and arrays. */
+/** Every string an error holds at any depth: its own properties, its causes, nested objects and arrays, and headers. */
 function errorText(error: unknown): string {
   const parts: string[] = [];
   const seen = new Set<object>();
@@ -90,6 +93,10 @@ function errorText(error: unknown): string {
     }
     if (typeof value !== "object" || value === null || seen.has(value)) return;
     seen.add(value);
+    if (value instanceof Headers) {
+      for (const [name, item] of value) parts.push(name, item);
+      return;
+    }
     const keys = value instanceof Error ? [...Object.getOwnPropertyNames(value), "cause"] : Object.keys(value);
     for (const key of keys) visit(Reflect.get(value, key));
   };
@@ -245,6 +252,51 @@ describe("explicit endpoints that carry keys", () => {
     const text = [errorText(thrown), ...events.map(errorText)].join("\n");
     expect(text).toContain("upstream https://hyperpc.example.test refused");
     expectNoSecret(text);
+  });
+  test("response headers and deeply nested error data are scrubbed", async () => {
+    const thrown: unknown[] = [];
+    const events: Error[] = [];
+    let nested: unknown = { endpoint: HYPERPC, revert: "0x08c379a0" };
+    for (let depth = 0; depth < 20; depth += 1) nested = { inner: nested, list: [depth] };
+    const replies = [
+      new Response("unavailable", { status: 503, headers: { location: `${HYPERPC}&retry=1` } }),
+      new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 0, error: { code: -32000, message: "upstream refused", data: nested } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    ];
+    for (const reply of replies) {
+      const client = open({
+        endpoints: [HYPERPC],
+        verifyChainId: false,
+        retryCount: 0,
+        fetchFn: async (_input, init) => {
+          const body = JSON.parse(String(init?.body)) as { id: number };
+          if (reply.status !== 200) return reply;
+          const payload = JSON.parse(await reply.clone().text()) as Record<string, unknown>;
+          return new Response(JSON.stringify({ ...payload, id: body.id }), { status: 200, headers: reply.headers });
+        },
+        onEvent: (event) => {
+          if (event.type === "error") events.push(event.error);
+        },
+      });
+      await client.request({ method: "eth_call", params: [] }).catch((error: unknown) => thrown.push(error));
+    }
+    expect(thrown).toHaveLength(2);
+    const [httpError, rpc] = thrown as [HttpRequestError, InvalidInputRpcError];
+    expect(httpError).toBeInstanceOf(HttpRequestError);
+    expect(httpError.status).toBe(503);
+    expect(httpError.headers?.get("location")).toBe("https://hyperpc.example.test&retry=1");
+    expect(rpc).toBeInstanceOf(InvalidInputRpcError);
+    expect(rpc.code).toBe(-32000);
+    let request: unknown = rpc;
+    while (request instanceof Error && !(request instanceof RpcRequestError)) request = request.cause;
+    expect(request).toBeInstanceOf(RpcRequestError);
+    let leaf = (request as RpcRequestError).data as { inner?: unknown; endpoint?: string; revert?: string };
+    for (let depth = 0; depth < 20; depth += 1) leaf = leaf.inner as typeof leaf;
+    expect(leaf).toEqual({ endpoint: "https://hyperpc.example.test", revert: "0x08c379a0" });
+    expect(events).toHaveLength(2);
+    expectNoSecret([...thrown, ...events].map(errorText).join("\n"));
   });
 });
 

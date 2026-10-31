@@ -91,6 +91,9 @@ const DEFAULT_RETRY_BACKOFF_MS = 100;
 /** Longest wait before a re-try. A call stops instead of waiting out a longer ejection. */
 const MAX_RETRY_BACKOFF_MS = 2_000;
 
+/** How long past its deadline an attempt still counts as in flight, in case its own cleanup was dropped. */
+const INFLIGHT_GRACE_MS = 1_000;
+
 export interface HeadLagOptions {
   /** Blocks of lag that do not change the score. Default: 2. */
   maxLag?: number | undefined;
@@ -555,7 +558,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
      * to true when it failed. The caller then picks again, so a verified pick is always synchronous and concurrent
      * calls see each other's in-flight counts: cold calls that all waited on one check spread out afterwards.
      * A failed check excludes the endpoint for this call and its reason joins `errors`, so it never costs an attempt.
-     * After a failed check, an ejected endpoint is not checked next, so a storm costs one check per call.
+     * With `skipEjected`, an ejected pick yields undefined before any check. The caller sets it on a failover and
+     * after a failed check, so a storm costs one check per call.
      */
     const pickVerified = (
       method: string,
@@ -601,7 +605,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       unrefTimer(timer as ReturnType<typeof setInterval>);
       const target = byId.get(endpoint.id);
       if (!target) throw new Error(`Unknown HyperEVM endpoint: ${endpoint.id}`);
-      board.begin(endpoint.id);
+      // Shared instances outlive the invocation that started an attempt, so the count expires on its own.
+      const end = board.begin(endpoint.id, timeout + INFLIGHT_GRACE_MS);
       emit({ type: "request", endpoint: endpoint.url, method });
       const started = now();
       // The child sees the caller's signal only. A private AbortController would
@@ -668,7 +673,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
           clearTimeout(timer);
           unlink();
           if (!controller.signal.aborted) controller.abort();
-          board.end(endpoint.id);
+          end();
         });
       return {
         promise,
@@ -701,16 +706,17 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         for (let backedOff = false; ; ) {
           // Waiting out a chain check is followed by a fresh pick. The last pick is synchronous, so
           // `start()` counts it in flight before any other call picks.
-          let skipEjected = false;
+          // Failing over into an ejected endpoint amplifies an outage, and checking its chain costs up to a
+          // timeout during its cooldown. A new round goes back to the endpoints that failed once instead,
+          // and stops if only ejected ones are left. A first attempt still takes an ejected endpoint
+          // when every candidate is ejected.
+          let skipEjected = attempt > 0 && !backedOff;
           let picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
           while (picked instanceof Promise) {
             skipEjected = (await picked) || skipEjected;
             picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
           }
           endpoint = picked;
-          // Failing over into an ejected endpoint amplifies an outage. A new round goes back to the
-          // endpoints that failed once instead, and stops if only ejected ones are left.
-          if (!backedOff && endpoint && attempt > 0 && breaker.isOpen(endpoint.id)) endpoint = undefined;
           if (endpoint || backedOff || exclude.size === 0) break;
           // Every usable endpoint failed this call, or failed its chain check. Start another round after a backoff.
           exclude.clear();
@@ -1150,6 +1156,7 @@ function redactErrors(
     try {
       return await request(args, options);
     } catch (error: unknown) {
+      if (typeof error === "string") throw scrub(error);
       scrubError(error, scrub);
       throw error;
     }
@@ -1157,14 +1164,17 @@ function redactErrors(
 }
 
 /**
- * Scrub every string `error` holds, in place: its own properties and cause, and the plain objects and arrays
- * under them. viem keeps the provider's JSON-RPC error, `data` included, as a plain-object cause.
+ * Scrub every string `error` holds, in place and at any depth: its own properties and cause, the plain objects
+ * and arrays under them, and `Headers`. viem keeps the provider's JSON-RPC error, `data` included, as a plain-object
+ * cause, and an HTTP error keeps the response headers. The walk keeps its own stack, so deep `data` cannot overflow.
  */
 function scrubError(error: unknown, scrub: (text: string) => string): void {
-  const seen = new Set<object>();
-  const visit = (value: unknown, depth: number): void => {
-    if (depth > 8 || typeof value !== "object" || value === null || seen.has(value)) return;
-    if (!(value instanceof Error) && !Array.isArray(value) && !isPlainObject(value)) return;
+  const seen = new WeakSet<object>();
+  const pending: unknown[] = [error];
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (typeof value !== "object" || value === null || seen.has(value)) continue;
+    if (!(value instanceof Error) && !Array.isArray(value) && !isPlainObject(value)) continue;
     seen.add(value);
     const keys = value instanceof Error ? new Set([...Object.getOwnPropertyNames(value), "cause"]) : Object.keys(value);
     for (const key of keys) {
@@ -1172,12 +1182,26 @@ function scrubError(error: unknown, scrub: (text: string) => string): void {
       if (typeof item === "string") {
         const scrubbed = scrub(item);
         if (scrubbed !== item) Reflect.set(value, key, scrubbed);
+      } else if (item instanceof Headers) {
+        const scrubbed = scrubHeaders(item, scrub);
+        if (scrubbed !== item) Reflect.set(value, key, scrubbed);
       } else {
-        visit(item, depth + 1);
+        pending.push(item);
       }
     }
-  };
-  visit(error, 0);
+  }
+}
+
+/** `headers`, or a scrubbed copy when a value held a secret. A response's headers are immutable, so they are replaced. */
+function scrubHeaders(headers: Headers, scrub: (text: string) => string): Headers {
+  const copy = new Headers();
+  let changed = false;
+  for (const [name, item] of headers) {
+    const scrubbed = scrub(item);
+    if (scrubbed !== item) changed = true;
+    copy.append(name, scrubbed);
+  }
+  return changed ? copy : headers;
 }
 
 function isPlainObject(value: object): boolean {

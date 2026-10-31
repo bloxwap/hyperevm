@@ -156,7 +156,7 @@ Type-checking uses `tsc --noEmit`. `bun run rank` probes the public lists and re
 
 **Registry rows and examples are public URLs.** Do not commit an RPC URL that contains an API key, username, or password. The ranker rejects credentials and query strings. Load a private endpoint from the environment. Bun reads a local `.env`, and this repository gitignores it.
 
-At runtime, `hyperevm()` accepts key-bearing URLs and exposes only a public label. Errors from those endpoints have every spelling of the URL replaced by the label. A provider that echoes the bare key on its own in an error body is not scrubbed.
+At runtime, `hyperevm()` accepts key-bearing URLs and exposes only a public label. Errors from those endpoints have every spelling of the URL replaced by the label, at any depth, response headers included. A provider that echoes the bare key on its own in an error body is not scrubbed.
 
 This package routes JSON-RPC. It does not sign transactions or hold a wallet.
 

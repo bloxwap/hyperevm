@@ -464,6 +464,62 @@ describe("breaker interactions", () => {
     expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
     expect(rpc.calls.map((call) => call.url)).toEqual([B, A, A, A]);
   });
+  test("a failover skips an ejected backup before checking its chain", async () => {
+    const urls: string[] = [];
+    const fetchFn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = JSON.parse(String(init?.body)) as RpcBody;
+      const seen = urls.filter((item) => item === url).length;
+      urls.push(url);
+      if (url === B)
+        return seen === 0 ? new Response("slow down", { status: 429, headers: { "retry-after": "30" } }) : hang();
+      if (body.method === "eth_call" && seen === 2) return new Response("unavailable", { status: 503 });
+      const result = body.method === "eth_chainId" ? "0x3e7" : "0x1";
+      return Response.json({ jsonrpc: "2.0", id: body.id, result });
+    };
+    const client = open({ endpoints: [B, A], fetchFn, verifyChainId: true, timeout: 1_000 });
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    const started = Date.now();
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(urls).toEqual([B, A, A, A, A]);
+  });
+});
+
+describe("in-flight accounting", () => {
+  test("an attempt stuck in a cancelled invocation stops counting as in flight after its deadline", async () => {
+    let nowMs = 0;
+    const fast = mockEndpoint("fast", (_method, seen) => {
+      if (seen === 3) return hang();
+      nowMs += 10;
+      return "0x1";
+    });
+    const slow = mockEndpoint("slow", () => {
+      nowMs += 30;
+      return "0x1";
+    });
+    const factory = hyperevm({
+      endpoints: [fast.transport, slow.transport],
+      headLag: false,
+      routing: "best",
+      hedge: false,
+      verifyChainId: false,
+      now: () => nowMs,
+    });
+    const first = factory({ timeout: 50 });
+    for (let index = 0; index < 3; index += 1) await first.request({ method: "eth_call", params: [] });
+    const abandoned = withoutTimers(() => first.request({ method: "eth_call", params: [] }));
+    void abandoned.catch(() => undefined);
+    await sleep(0);
+    expect(first.value?.snapshot()[0]?.inflight).toBe(1);
+    nowMs += 5_000;
+    // A new client on the same factory shares the scoreboard the abandoned call left behind.
+    const next = factory({ timeout: 50 });
+    expect(next.value?.snapshot()[0]?.inflight).toBe(0);
+    for (let index = 0; index < 20; index += 1) await next.request({ method: "eth_call", params: [] });
+    expect(fast.calls).toHaveLength(24);
+    expect(slow.calls).toHaveLength(0);
+  });
 });
 
 describe("filter polling", () => {

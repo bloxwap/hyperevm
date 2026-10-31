@@ -28,7 +28,8 @@ export interface ScoreboardEndpoint extends RankedEndpoint {
 }
 
 interface EndpointState extends ScoreboardEndpoint {
-  inflight: number;
+  /** Deadlines of the calls in flight. A call past its deadline no longer counts, whether or not it ended. */
+  inflight: Set<{ readonly until: number }>;
   head: number | null;
   headAt: number;
   global: MethodStat;
@@ -65,7 +66,7 @@ export class Scoreboard {
   constructor(endpoints: readonly ScoreboardEndpoint[], options: ScoreboardOptions) {
     this.#endpoints = endpoints.map((endpoint) => ({
       ...endpoint,
-      inflight: 0,
+      inflight: new Set(),
       head: null,
       headAt: 0,
       global: emptyStat(),
@@ -95,14 +96,17 @@ export class Scoreboard {
     return { id: chosen.id, url: chosen.url };
   }
 
-  begin(id: string): void {
+  /**
+   * Count a call in flight for at most `ttlMs`. Returns the function that ends it. Calling that again does nothing.
+   * The cap matters when the runtime drops the call's own cleanup, as Workers does with a cancelled invocation.
+   */
+  begin(id: string, ttlMs: number): () => void {
     const endpoint = this.#require(id);
-    endpoint.inflight += 1;
-  }
-
-  end(id: string): void {
-    const endpoint = this.#require(id);
-    endpoint.inflight = Math.max(0, endpoint.inflight - 1);
+    const call = { until: this.#options.now() + ttlMs };
+    endpoint.inflight.add(call);
+    return (): void => {
+      endpoint.inflight.delete(call);
+    };
   }
 
   success(id: string, method: string, latencyMs: number, sampleLatency: boolean): void {
@@ -161,7 +165,7 @@ export class Scoreboard {
       id: endpoint.id,
       url: endpoint.url,
       weight: endpoint.weight,
-      inflight: endpoint.inflight,
+      inflight: this.#inflight(endpoint),
       head: endpoint.head,
       lag: this.#lag(endpoint, view),
       score: this.#score(endpoint, method),
@@ -191,11 +195,18 @@ export class Scoreboard {
       global: endpoint.global,
       method: endpoint.methods.get(method),
       perMethod: this.#options.perMethod,
-      inflight: endpoint.inflight,
+      inflight: this.#inflight(endpoint),
       lagPenalty: this.#lagPenalty(endpoint),
       weight: endpoint.weight,
       config: this.#options.config ?? defaultScoreConfig,
     });
+  }
+
+  /** Calls in flight that are still inside their deadline. Expired ones are dropped. */
+  #inflight(endpoint: EndpointState): number {
+    const now = this.#options.now();
+    for (const call of endpoint.inflight) if (call.until <= now) endpoint.inflight.delete(call);
+    return endpoint.inflight.size;
   }
 
   /** Null when there is no head, no believed reference, or this endpoint's head is ignored. */
