@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { emptyStat, endpointScore, inflation, observe, serviceMs } from "../src/score.ts";
+import { emptyStat, endpointScore, inflation, observe, serviceMs } from "../../src/transport/_score.ts";
 
 describe("endpointScore", () => {
   test("inflation grows with in-flight calls and includes a squared queue term", () => {

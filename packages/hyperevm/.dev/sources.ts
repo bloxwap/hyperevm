@@ -4,8 +4,8 @@
  * @module
  */
 
-import type { RegistryEndpointInput, RegistrySource, Tracking } from "../src/policy.ts";
-import { isWanchainHost, normalizeRpcUrl } from "../src/url.ts";
+import type { RegistryEndpointInput, RegistrySource, Tracking } from "../src/registry/_policy.ts";
+import { isWanchainHost, normalizeRpcUrl } from "../src/registry/_url.ts";
 
 export const SOURCE_URLS = {
   chainlistChain:

@@ -11,7 +11,7 @@ Requires [Bun](https://bun.sh) and Node.js 22.12 or newer (Bun is what the scrip
 ```sh
 bun install --frozen-lockfile
 bun run check
-bun test
+bun run test
 bun run build
 ```
 
@@ -19,7 +19,7 @@ bun run build
 
 ## Submitting a public RPC endpoint
 
-The default transport reads [`registry/nodes.json`](registry/nodes.json). Add a node by pull request. The weekly rank workflow probes what you added and opens a follow-up PR with weights. It does not push to `main`.
+The default transport reads [`packages/hyperevm/registry/nodes.json`](packages/hyperevm/registry/nodes.json). Add a node by pull request. The weekly rank workflow probes what you added and opens a follow-up PR with weights. It does not push to `main`.
 
 One endpoint per pull request is easiest to review.
 
@@ -47,7 +47,7 @@ One endpoint per pull request is easiest to review.
 `sources[0].url` should be a page that lists this endpoint, not a private dashboard. Set `tracking` to `none`, `limited`, or `yes` when the operator says whether they log requests. Use `unknown` when you do not know.
 
 4. Leave `eligible`, `weight`, `rank`, and `stats` as above. Do not copy a weight from another row. The ranker is the only writer of those fields. A new URL stays on the new-node cap (weight 0.15) until it has at least three successful probes spread across 14 days, with uptime of at least 0.8. Until then it is usable, but it cannot take the pool. See [docs/ranking.md](docs/ranking.md).
-5. Run `bun test tests/registry.test.ts` so the file still matches the schema checks.
+5. Run `bun run test` so the file still matches the schema checks.
 
 Community rows are kept when upstream lists forget them. An upstream row that disappears from every source is removed on the next successful rank run.
 

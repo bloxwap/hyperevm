@@ -4,11 +4,11 @@
  * @module
  */
 
-export {};
+const packageRoot = new URL("../../", import.meta.url);
 
 const result = await Bun.build({
-  entrypoints: ["./src/mod.ts"],
-  outdir: "./dist",
+  entrypoints: [new URL("src/mod.ts", packageRoot).pathname],
+  outdir: new URL("dist", packageRoot).pathname,
   format: "esm",
   target: "node",
   sourcemap: "external",
@@ -21,3 +21,5 @@ if (!result.success) {
 }
 
 console.log(`Built ${result.outputs.length} file(s) to dist/.`);
+
+export {};

@@ -1,62 +1,24 @@
 {
-  "//exports": "Points at TypeScript sources. Bun consumes them directly, and the package is not published. dist/ is a bundle emit so CI can prove the entry builds. Publishing needs a separate approval.",
-  "name": "@bloxwap/hyperevm",
-  "version": "0.1.0",
+  "name": "@bloxwap/hyperevm-workspace",
   "private": true,
-  "description": "Performance-optimized, load-balanced RPC transport for HyperEVM. A drop-in upgrade over viem's fallback transport.",
   "license": "MIT",
   "type": "module",
-  "sideEffects": false,
-  "keywords": [
-    "hyperevm",
-    "hyperliquid",
-    "rpc",
-    "viem",
-    "transport",
-    "load-balancer",
-    "fallback",
-    "evm",
-    "typescript"
-  ],
-  "homepage": "https://github.com/bloxwap/hyperevm#readme",
-  "bugs": {
-    "url": "https://github.com/bloxwap/hyperevm/issues"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/bloxwap/hyperevm.git"
-  },
-  "engines": {
-    "node": ">=22.12.0"
-  },
-  "exports": {
-    ".": "./src/mod.ts"
-  },
-  "files": [
-    "src",
-    "registry",
-    "dist",
-    "README.md",
-    "LICENSE"
+  "workspaces": [
+    "packages/*"
   ],
   "scripts": {
-    "check": "bun run check:format && bun run check:lint && bun run typecheck",
+    "check": "bun run check:format && bun run check:lint && bun run check:sdk",
     "check:format": "biome format .",
     "check:lint": "biome lint .",
+    "check:sdk": "cd packages/hyperevm && bun run typecheck",
     "format": "biome format --write .",
     "lint": "biome lint --write .",
-    "typecheck": "tsc --noEmit",
-    "test": "bun test tests/",
-    "build": "bun run scripts/build.ts",
-    "rank": "bun run scripts/rank-registry.ts"
-  },
-  "peerDependencies": {
-    "viem": "^2.0.0"
+    "typecheck": "bun run check:sdk",
+    "test": "cd packages/hyperevm && bun run test",
+    "build": "cd packages/hyperevm && bun run build",
+    "rank": "cd packages/hyperevm && bun run rank"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.15",
-    "@types/bun": "1.4.3",
-    "typescript": "5.9.3",
-    "viem": "2.57.7"
+    "@biomejs/biome": "2.5.15"
   }
 }

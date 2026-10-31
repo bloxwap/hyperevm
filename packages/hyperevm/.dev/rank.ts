@@ -5,14 +5,19 @@
  * healthy registry would be replaced by a run where every probe missed chain
  * id 999. That keeps one bad network day from emptying the default pool.
  *
- * Usage: `bun run rank` or `bun run scripts/rank-registry.ts --dry-run`
+ * Usage: `bun run rank` or `bun run .dev/rank.ts --dry-run`
  * @module
  */
 
 import { readFile, writeFile } from "node:fs/promises";
 
-import { defaultRankPolicy, mergeEndpointInputs, rankRegistry, type ProbeObservation } from "../src/policy.ts";
-import { assertRegistryFile, type RegistryFile } from "../src/registry.ts";
+import {
+  defaultRankPolicy,
+  mergeEndpointInputs,
+  rankRegistry,
+  type ProbeObservation,
+} from "../src/registry/_policy.ts";
+import { assertRegistryFile, type RegistryFile } from "../src/registry/_registry.ts";
 import { assignLags, mapPool, probeEndpoint } from "./probe.ts";
 import { loadSources } from "./sources.ts";
 

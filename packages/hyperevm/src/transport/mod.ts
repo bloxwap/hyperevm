@@ -19,13 +19,18 @@ import {
   type Transport,
 } from "viem";
 
-import type { EndpointSnapshot, HyperevmEvent } from "./events.ts";
-import { AllEndpointsFailedError, TimeoutError } from "./errors.ts";
-import { isAbortError, isIdempotentMethod, shouldFailover, toError } from "./methods.ts";
-import { registryHttpEndpoints } from "./registry.ts";
-import { type RankedEndpoint, Scoreboard, blockNumberFromResult } from "./scoreboard.ts";
-import { type ScoreConfig, defaultScoreConfig } from "./score.ts";
-import { normalizeRpcUrl } from "./url.ts";
+import { AllEndpointsFailedError, TimeoutError } from "../_errors.ts";
+import { registryHttpEndpoints } from "../registry/_registry.ts";
+import { normalizeRpcUrl } from "../registry/_url.ts";
+import type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
+import { isAbortError, isIdempotentMethod, shouldFailover, toError } from "./_methods.ts";
+import { type ScoreConfig, defaultScoreConfig } from "./_score.ts";
+import { type RankedEndpoint, Scoreboard, blockNumberFromResult } from "./_scoreboard.ts";
+
+export type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
+export { NON_IDEMPOTENT_METHODS, isIdempotentMethod, shouldFailover } from "./_methods.ts";
+export { blockNumberFromResult, parseQuantity } from "./_scoreboard.ts";
+export { defaultScoreConfig, endpointScore, inflation, type MethodStat, type ScoreConfig } from "./_score.ts";
 
 /** How long a head sample stays usable for lag penalties. */
 const DEFAULT_STALE_MS = 30_000;

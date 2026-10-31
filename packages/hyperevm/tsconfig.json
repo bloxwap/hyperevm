@@ -1,7 +1,7 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "target": "es2024",
+    "lib": ["es2024", "dom", "dom.iterable"],
     "module": "preserve",
     "moduleResolution": "bundler",
     "types": ["bun"],
@@ -17,5 +17,6 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts", "registry/**/*.json"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", ".dev/**/*.ts", "registry/**/*.json"],
+  "exclude": ["node_modules", "dist"]
 }

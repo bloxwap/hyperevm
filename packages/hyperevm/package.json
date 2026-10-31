@@ -1,0 +1,59 @@
+{
+  "//exports": "Points at TypeScript sources. Bun consumes them directly, and the package is not published. dist/ is a bundle emit so CI can prove the entry builds. Publishing needs a separate approval.",
+  "name": "@bloxwap/hyperevm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Performance-optimized, load-balanced RPC transport for HyperEVM. A drop-in upgrade over viem's fallback transport.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "keywords": [
+    "hyperevm",
+    "hyperliquid",
+    "rpc",
+    "viem",
+    "transport",
+    "load-balancer",
+    "fallback",
+    "evm",
+    "typescript"
+  ],
+  "homepage": "https://github.com/bloxwap/hyperevm#readme",
+  "bugs": {
+    "url": "https://github.com/bloxwap/hyperevm/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bloxwap/hyperevm.git",
+    "directory": "packages/hyperevm"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "exports": {
+    ".": "./src/mod.ts",
+    "./transport": "./src/transport/mod.ts",
+    "./registry": "./src/registry/mod.ts"
+  },
+  "files": [
+    "src",
+    "registry",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --project tsconfig.json",
+    "test": "bun test tests/",
+    "build": "bun run .dev/build/build.ts",
+    "rank": "bun run .dev/rank.ts"
+  },
+  "peerDependencies": {
+    "viem": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.3",
+    "typescript": "5.9.3",
+    "viem": "2.57.7"
+  }
+}

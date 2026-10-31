@@ -55,7 +55,7 @@
   },
   "overrides": [
     {
-      "includes": ["tests/**", "scripts/**"],
+      "includes": ["**/tests/**", "**/.dev/**"],
       "linter": {
         "rules": {
           "suspicious": {

@@ -3,7 +3,7 @@
  * @module
  */
 
-import type { EndpointSnapshot } from "./events.ts";
+import type { EndpointSnapshot } from "./_events.ts";
 import {
   type MethodStat,
   type ScoreConfig,
@@ -12,7 +12,7 @@ import {
   endpointScore,
   observe,
   observeLiveness,
-} from "./score.ts";
+} from "./_score.ts";
 
 /** Identity of an endpoint the transport can call. */
 export interface RankedEndpoint {
