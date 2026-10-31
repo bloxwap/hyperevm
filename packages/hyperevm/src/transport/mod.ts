@@ -19,7 +19,7 @@ import {
   type Transport,
 } from "viem";
 
-import { AllEndpointsFailedError, ChainMismatchError, TimeoutError } from "../_errors.ts";
+import { AllEndpointsFailedError, ChainMismatchError, TimeoutError, TransportClosedError } from "../_errors.ts";
 import { defaultRegistry, registryHttpEndpoints } from "../registry/_registry.ts";
 import { type EndpointUrl, normalizeEndpointUrl } from "../registry/_url.ts";
 import type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
@@ -47,6 +47,9 @@ const DEFAULT_MAX_LAG = 2;
 /** Background `eth_blockNumber` cadence. This refreshes heads. It is not the latency ranker. */
 const DEFAULT_PROBE_MS = 4_000;
 
+/** The probe timer stops after this long without a request, and restarts on the next one. */
+const DEFAULT_PROBE_IDLE_MS = 60_000;
+
 /** viem's HTTP default. Our own deadline races the child transport. */
 const DEFAULT_TIMEOUT_MS = 10_000;
 
@@ -59,8 +62,13 @@ const DEFAULT_CHAIN_ID = 999;
 export interface HeadLagOptions {
   /** Blocks of lag that do not change the score. Default: 2. */
   maxLag?: number | undefined;
-  /** Milliseconds between head probes. `false` disables the timer. Default: 4000. */
+  /**
+   * Milliseconds between head probes. `false` disables the timer. Default: 4000.
+   * The timer starts on the first request, not when the transport is built.
+   */
   probeInterval?: number | false | undefined;
+  /** Stop the probe timer after this many milliseconds without a request. `false` never stops it. Default: 60000. */
+  probeIdleTimeout?: number | false | undefined;
   /** Heads older than this stop affecting the score. Default: 30000. */
   staleMs?: number | undefined;
   /**
@@ -167,12 +175,22 @@ export interface HyperevmTransportValue {
    * The background timer calls this on `probeInterval`. A failed probe updates liveness and does not write the latency EWMA.
    */
   probe: () => Promise<void>;
+  /**
+   * Stop the probe timer and reject later requests with `TransportClosedError`. Calls already in flight finish.
+   * Calling it again does nothing.
+   *
+   * One `hyperevm()` factory shares a single instance across instantiations with the same timeout,
+   * retryCount and chain id, so closing it closes every client built that way.
+   * The next instantiation after `close()` builds a fresh instance.
+   */
+  close: () => void;
 }
 
 interface ResolvedHeadLag {
   enabled: boolean;
   maxLag: number;
   probeInterval: number | false;
+  probeIdleTimeout: number | false;
   staleMs: number;
   maxAhead: number;
 }
@@ -214,6 +232,7 @@ function resolveHeadLag(value: boolean | HeadLagOptions | undefined): ResolvedHe
       enabled: false,
       maxLag: DEFAULT_MAX_LAG,
       probeInterval: false,
+      probeIdleTimeout: DEFAULT_PROBE_IDLE_MS,
       staleMs: DEFAULT_STALE_MS,
       maxAhead: DEFAULT_MAX_AHEAD,
     };
@@ -223,6 +242,7 @@ function resolveHeadLag(value: boolean | HeadLagOptions | undefined): ResolvedHe
     enabled: true,
     maxLag: options.maxLag ?? DEFAULT_MAX_LAG,
     probeInterval: options.probeInterval === undefined ? DEFAULT_PROBE_MS : options.probeInterval,
+    probeIdleTimeout: options.probeIdleTimeout === undefined ? DEFAULT_PROBE_IDLE_MS : options.probeIdleTimeout,
     staleMs: options.staleMs ?? DEFAULT_STALE_MS,
     maxAhead: options.maxAhead ?? DEFAULT_MAX_AHEAD,
   };
@@ -270,19 +290,27 @@ function abortError(signal: AbortSignal): Error {
   return error;
 }
 
-function linkAbort(controller: AbortController, signal: AbortSignal | undefined): void {
-  if (!signal) return;
+const unlinked = (): void => undefined;
+
+/** Forwards an abort from `signal` to `controller`. Returns a function that removes the listener from `signal`. */
+function linkAbort(controller: AbortController, signal: AbortSignal | undefined): () => void {
+  if (!signal) return unlinked;
   if (signal.aborted) {
     controller.abort(signal.reason);
-    return;
+    return unlinked;
   }
-  signal.addEventListener(
-    "abort",
-    () => {
-      controller.abort(signal.reason);
-    },
-    { once: true },
-  );
+  const onAbort = (): void => {
+    controller.abort(signal.reason);
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  return () => {
+    signal.removeEventListener("abort", onAbort);
+  };
+}
+
+/** Cache key for instances one factory shares. Inputs that change routing get separate instances. */
+function sharedKey(timeout: number, retryCount: number, chain: Chain | undefined): string {
+  return `${timeout}:${retryCount}:${chain?.id ?? ""}`;
 }
 
 /**
@@ -307,6 +335,9 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
   const now = options.now ?? ((): number => Date.now());
   const random = options.random ?? Math.random;
   const extraNonIdempotent = options.nonIdempotentMethods ?? [];
+  // viem instantiates the transport once per client. Sharing keeps per-request clients
+  // from multiplying probe timers or resetting learned scores.
+  const shared = new Map<string, ReturnType<Transport<"hyperevm", HyperevmTransportValue>>>();
 
   return (parameters: {
     account?: unknown;
@@ -318,6 +349,9 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     const timeout = options.timeout ?? parameters.timeout ?? DEFAULT_TIMEOUT_MS;
     const retryCount = options.retryCount ?? parameters.retryCount ?? DEFAULT_RETRY_COUNT;
     const retryDelay = options.retryDelay ?? 0;
+    const key = sharedKey(timeout, retryCount, parameters.chain);
+    const existing = shared.get(key);
+    if (existing) return existing;
     const built = buildEndpoints(options, parameters.chain, timeout);
     if (built.length === 0) {
       throw new Error("hyperevm() requires at least one endpoint. The registry has none eligible.");
@@ -450,7 +484,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     ): Inflight => {
       const state = { ignore: false, timedOut: false };
       const controller = new AbortController();
-      linkAbort(controller, parent);
+      const unlink = linkAbort(controller, parent);
       const timer = setTimeout(() => {
         state.timedOut = true;
         controller.abort();
@@ -514,6 +548,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         })
         .finally(() => {
           clearTimeout(timer);
+          unlink();
           if (!controller.signal.aborted) controller.abort();
           board.end(endpoint.id);
         });
@@ -582,7 +617,10 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       });
     };
 
+    let closed = false;
+
     const probe = (): Promise<void> => {
+      if (closed) return Promise.resolve();
       const pending = built.map((endpoint) =>
         checkChain(endpoint).then((reason) =>
           reason
@@ -596,12 +634,31 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       return Promise.all(pending).then(() => undefined);
     };
 
-    if (headLag.enabled && headLag.probeInterval !== false && headLag.probeInterval > 0) {
-      const timer = setInterval(() => {
+    const probeEvery =
+      headLag.enabled && headLag.probeInterval !== false && headLag.probeInterval > 0 ? headLag.probeInterval : 0;
+    let probeTimer: ReturnType<typeof setInterval> | undefined;
+    let lastRequestAt = 0;
+
+    const stopProbes = (): void => {
+      if (probeTimer === undefined) return;
+      clearInterval(probeTimer);
+      probeTimer = undefined;
+    };
+
+    // Runs on every request. The timer starts here, so building a client does no timer work or I/O.
+    const touch = (): void => {
+      lastRequestAt = Date.now();
+      if (probeEvery === 0 || probeTimer !== undefined) return;
+      probeTimer = setInterval(() => {
+        const idle = headLag.probeIdleTimeout;
+        if (idle !== false && Date.now() - lastRequestAt >= idle) {
+          stopProbes();
+          return;
+        }
         void probe();
-      }, headLag.probeInterval);
-      unrefTimer(timer);
-    }
+      }, probeEvery);
+      unrefTimer(probeTimer);
+    };
 
     const value: HyperevmTransportValue = {
       onEvent(listener: (event: HyperevmEvent) => void): () => void {
@@ -614,9 +671,15 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         board.snapshot(method).map((entry) => ({ ...entry, quarantined: quarantined(entry.id) })),
       endpoints: built.map((endpoint) => ({ id: endpoint.id, url: endpoint.url, weight: endpoint.weight })),
       probe,
+      close(): void {
+        if (closed) return;
+        closed = true;
+        stopProbes();
+        if (shared.get(key) === transport) shared.delete(key);
+      },
     };
 
-    return createTransport(
+    const transport = createTransport(
       {
         key: options.key ?? "hyperevm",
         name: options.name ?? "HyperEVM",
@@ -625,6 +688,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         timeout,
         type: "hyperevm",
         request: (async (args: EIP1193Parameters, requestOptions?: EIP1193RequestOptions): Promise<unknown> => {
+          if (closed) throw new TransportClosedError();
+          touch();
           const method = args.method;
           const idempotent = isIdempotentMethod(method, extraNonIdempotent);
           return send(method, "params" in args ? args.params : undefined, requestOptions?.signal, idempotent);
@@ -632,6 +697,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       },
       value,
     );
+    shared.set(key, transport);
+    return transport;
   };
 }
 
@@ -684,28 +751,20 @@ function raceHedge(primary: Inflight, waitMs: number, startHedge: () => Inflight
 
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    if (!signal) return;
-    if (signal.aborted) {
-      clearTimeout(timer);
+    if (signal?.aborted) {
       reject(toError(signal.reason ?? new Error("This operation was aborted")));
       return;
     }
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        const reason = signal.reason;
-        if (reason instanceof Error) {
-          reject(reason);
-          return;
-        }
-        const error = new Error("This operation was aborted");
-        error.name = "AbortError";
-        reject(error);
-      },
-      { once: true },
-    );
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal ? abortError(signal) : new Error("This operation was aborted"));
+    };
+    // A long-lived caller signal would otherwise keep one listener per retry wait.
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

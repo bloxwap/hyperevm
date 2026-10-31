@@ -55,3 +55,14 @@ export class ChainMismatchError extends BaseError {
     this.chainId = chainId;
   }
 }
+
+/** Thrown by `request()` after `value.close()`. Instantiate the transport again to keep going. */
+export class TransportClosedError extends BaseError {
+  constructor() {
+    super("HyperEVM transport is closed.", {
+      details: "value.close() was called on this transport.",
+      name: "TransportClosedError",
+    });
+    this.name = "TransportClosedError";
+  }
+}
