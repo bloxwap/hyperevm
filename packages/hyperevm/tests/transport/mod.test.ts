@@ -39,6 +39,8 @@ function open(options: HyperevmTransportOptions) {
     routing: "best",
     retryCount: 2,
     hedge: false,
+    // These mocks answer every method alike. Chain checks have their own tests.
+    verifyChainId: false,
     ...options,
   })({ timeout: options.timeout ?? 1_000 });
 }
@@ -322,7 +324,8 @@ describe("head trust through viem http", () => {
       calls.push({ host, method: body.method, params: body.params });
       const answer = answers[host];
       if (!answer) throw new Error(`unexpected host ${host}`);
-      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: answer(body.method, body.params) }), {
+      const result = body.method === "eth_chainId" ? "0x3e7" : answer(body.method, body.params);
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

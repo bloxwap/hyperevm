@@ -23,7 +23,7 @@
  * @module
  */
 
-export { AllEndpointsFailedError, TimeoutError } from "./_errors.ts";
+export { AllEndpointsFailedError, ChainMismatchError, TimeoutError } from "./_errors.ts";
 export {
   HYPEREVM_CHAIN_ID,
   assertRegistryFile,
@@ -61,6 +61,8 @@ export {
   type EndpointSnapshot,
   type HeadLagOptions,
   type HedgeOptions,
+  type HyperevmEndpoint,
+  type HyperevmEndpointConfig,
   type HyperevmEvent,
   type HyperevmTransportOptions,
   type HyperevmTransportValue,
