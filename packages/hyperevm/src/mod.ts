@@ -49,15 +49,18 @@ export {
 } from "./registry/mod.ts";
 export {
   NON_IDEMPOTENT_METHODS,
+  REBROADCAST_METHODS,
   blockNumberFromResult,
   defaultScoreConfig,
   endpointScore,
   hyperevm,
   inflation,
   isIdempotentMethod,
+  isRebroadcastMethod,
   parseQuantity,
   shouldFailover,
   type BatchOptions,
+  type BreakerOptions,
   type EndpointSnapshot,
   type HeadLagOptions,
   type HedgeOptions,

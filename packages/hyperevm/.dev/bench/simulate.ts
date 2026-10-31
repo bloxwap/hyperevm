@@ -291,6 +291,8 @@ async function runHyperevm(
     hedge: false,
     routing,
     retryCount: specs.length - 1,
+    // The published tables measure scoring alone. The breaker would eject the dead node after three probes.
+    breaker: false,
     random: mulberry32(0xdecaf),
     now: () => clock.value,
     score,

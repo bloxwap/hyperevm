@@ -81,9 +81,7 @@ describe("hyperevm transport", () => {
     });
     const second = mockEndpoint("second", () => "0xhash");
     const client = open({ endpoints: [first.transport, second.transport] });
-    await expect(client.request({ method: "eth_sendRawTransaction", params: ["0xabc"] })).rejects.toThrow(
-      /timeout talking/,
-    );
+    await expect(client.request({ method: "eth_sendTransaction", params: [{}] })).rejects.toThrow(/timeout talking/);
     expect(first.calls).toHaveLength(1);
     expect(second.calls).toHaveLength(0);
   });
