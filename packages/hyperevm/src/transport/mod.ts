@@ -140,7 +140,7 @@ export interface BatchOptions {
 export interface HyperevmEndpointConfig {
   /** RPC URL. It may carry an API key in its path, query, or credentials. The key never leaves the transport. */
   url?: string | undefined;
-  /** viem transport to call instead of a URL. */
+  /** viem transport to call instead of a URL. It keeps only the `Retry-After` viem's errors carry. Prefer `url`. */
   transport?: Transport | undefined;
   /** Name used in events, snapshots, and errors. Default: the registry URL, or `scheme://host[:port]`. */
   label?: string | undefined;
@@ -157,6 +157,9 @@ export interface HyperevmTransportOptions {
    * URLs, viem transports, or endpoint configs. URLs become `http()` or `webSocket()`.
    * Explicit URLs may carry an API key. Only a public label is ever exposed.
    * Duplicate URLs or labels throw. Default: eligible HTTP endpoints from the shipped registry.
+   *
+   * Pass a keyed provider URL as a string or `{ url, label }`, not `http(url)`. viem drops the headers of a 429 or
+   * 503 whose body is a JSON-RPC error, so only a transport built here keeps its `Retry-After` for the breaker.
    */
   endpoints?: readonly HyperevmEndpoint[] | undefined;
   /**
@@ -732,6 +735,12 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
             const ejectedMs = breaker.remaining(candidate.id);
             if (ejectedMs > MAX_RETRY_BACKOFF_MS) break;
             await delay(Math.max(backoffMs(round, retryBackoff, random), ejectedMs), parent);
+            // A concurrent call may eject the endpoint during the wait. Judge it as it is now, so the re-try does not
+            // land in a fresh cooldown and end it early. The same 2 second rule applies.
+            const revisit = board.pick(method, exclude, "best", random);
+            const leftMs = revisit ? breaker.remaining(revisit.id) : 0;
+            if (!revisit || leftMs > MAX_RETRY_BACKOFF_MS) break;
+            if (leftMs > 0 && ejectedMs === 0) await delay(leftMs, parent);
             round += 1;
             wait = 0;
             mode = "best";

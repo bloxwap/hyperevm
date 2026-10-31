@@ -81,7 +81,7 @@ const transport = hyperevm({
 });
 ```
 
-URL strings are wrapped in viem's `http()`, or `webSocket()` when the URL is `wss://`. A transport you pass in keeps the batching it was created with. Idempotent reads fail over on timeout, rate limit, and connection loss. Once every endpoint has failed a call, the transport backs off and tries again while `retryCount` allows. An endpoint that keeps failing is ejected for a cooldown.
+URL strings are wrapped in viem's `http()`, or `webSocket()` when the URL is `wss://`. A transport you pass in keeps the batching it was created with. Pass provider URLs as strings or `{ url, label }` rather than `http(url)`: viem drops the headers of a 429 or 503 whose body is a JSON-RPC error, so only a transport built from a URL keeps its `Retry-After`. Idempotent reads fail over on timeout, rate limit, and connection loss. Once every endpoint has failed a call, the transport backs off and tries again while `retryCount` allows. An endpoint that keeps failing is ejected for a cooldown.
 
 `eth_sendRawTransaction` and `eth_sendRawTransactionSync` fail over on endpoint errors, because the same signed bytes have the same hash and the nonce stops a second execution. They are never hedged. The other non-idempotent methods go to one endpoint.
 

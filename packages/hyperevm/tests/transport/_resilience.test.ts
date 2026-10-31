@@ -423,18 +423,21 @@ describe("chain checks under concurrency", () => {
 });
 
 describe("breaker interactions", () => {
-  test("a JSON-RPC rate limit on an HTTP 429 keeps its Retry-After", async () => {
+  test.each([
+    ["a URL string", A, label(A)],
+    ["an object with url and label", { url: A, label: "keyed" }, "keyed"],
+  ] as const)("a JSON-RPC rate limit on an HTTP 429 keeps its Retry-After for %s", async (_name, endpoint, id) => {
     const events: HyperevmEvent[] = [];
     const rpc = mockFetch(() => ({
       status: 429,
       error: { code: -32005, message: "rate limited" },
       headers: { "retry-after": "30" },
     }));
-    const client = open({ endpoints: [A], fetchFn: rpc.fetchFn, onEvent: (event) => events.push(event) });
+    const client = open({ endpoints: [endpoint], fetchFn: rpc.fetchFn, onEvent: (event) => events.push(event) });
     await expect(client.request({ method: "eth_call", params: [] })).rejects.toThrow();
     expect(rpc.calls).toHaveLength(1);
     const eject = events.find((event) => event.type === "eject");
-    expect(eject).toMatchObject({ type: "eject", endpoint: label(A), failures: 1 });
+    expect(eject).toMatchObject({ type: "eject", endpoint: id, failures: 1 });
     // The wait counts from the response, so a millisecond may pass before the failure is recorded.
     expect(eject?.type === "eject" && eject.cooldownMs > 29_000).toBe(true);
   });
@@ -528,6 +531,35 @@ describe("delayed failover", () => {
     expect(await p).toBe("0xa");
     expect(calls).toEqual(["a:eth_call", "b:eth_getBalance", "a:eth_call"]);
     expect(events.some((event) => event.type === "restore")).toBe(false);
+  });
+});
+
+describe("backoff rounds", () => {
+  test("an endpoint ejected by a concurrent call during the backoff is not retried", async () => {
+    const events: HyperevmEvent[] = [];
+    const rpc = mockFetch((_url, body) => {
+      if (body.method === "eth_chainId") return { result: "0x3e7" };
+      if (body.method === "eth_getBalance") return { status: 429, headers: { "retry-after": "30" } };
+      const reads = rpc.calls.filter((call) => call.method === "eth_call").length;
+      return reads === 1 ? { status: 503 } : { result: "0x1" };
+    });
+    // Default options: chain checks, probes, p2c routing, and the breaker are all on.
+    const client = hyperevm({ endpoints: [A], fetchFn: rpc.fetchFn, onEvent: (event) => events.push(event) })({});
+    // P gets a 503 from the only endpoint and backs off before trying it again.
+    const p = client.request({ method: "eth_call", params: [] }).then(
+      () => "served",
+      (error: unknown) => error,
+    );
+    await sleep(20);
+    // Q gets a 429 asking for 30 seconds while P waits.
+    await expect(client.request({ method: "eth_getBalance", params: ["0x0", "latest"] })).rejects.toThrow();
+    expect(events.some((event) => event.type === "eject")).toBe(true);
+    const outcome = await p;
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/Status: 503/);
+    expect(rpc.calls.map((call) => call.method)).toEqual(["eth_chainId", "eth_call", "eth_getBalance"]);
+    expect(events.some((event) => event.type === "restore")).toBe(false);
+    client.value?.close();
   });
 });
 
