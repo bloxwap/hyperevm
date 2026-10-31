@@ -6,7 +6,7 @@ import {
   rankRegistry,
   type ProbeObservation,
   type RegistryEndpointInput,
-} from "../src/policy.ts";
+} from "../../src/registry/_policy.ts";
 
 const NOW = Date.parse("2026-10-30T00:00:00.000Z");
 const DAY = 24 * 60 * 60 * 1000;

@@ -1,6 +1,7 @@
 [install]
-# Refuse dependency versions published within the last 3 days.
+# Match the SDK workspace: one install graph, and refuse versions published within the last 3 days.
+linker = "isolated"
 minimumReleaseAge = 259200
 
 [test]
-coveragePathIgnorePatterns = ["tests/**", "scripts/**"]
+coveragePathIgnorePatterns = ["packages/hyperevm/tests/**", "packages/hyperevm/.dev/**"]

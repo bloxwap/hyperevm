@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
-import { assignLags } from "../scripts/probe.ts";
-import type { ProbeObservation } from "../src/policy.ts";
+import { assignLags } from "../../.dev/probe.ts";
+import type { ProbeObservation } from "../../src/registry/_policy.ts";
 
 function observation(url: string, head: number, headAt: string): ProbeObservation {
   return {

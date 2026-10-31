@@ -1,0 +1,6 @@
+[install]
+# Supply-chain protection: refuse dependency versions published within the last 3 days.
+minimumReleaseAge = 259200
+
+[test]
+coveragePathIgnorePatterns = ["tests/**", ".dev/**"]

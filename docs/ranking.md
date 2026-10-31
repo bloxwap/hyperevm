@@ -43,7 +43,7 @@ Hedging is off unless you set `hedge`. When it is on, an idempotent read that is
 
 ## Registry score
 
-`scripts/rank-registry.ts` fetches the source lists, merges them with `registry/nodes.json`, probes every HTTP URL, appends the observations to `registry/history.json`, and writes ranks back. The workflow `.github/workflows/rank-registry.yml` runs that weekly and on demand, then opens a pull request. It does not push to `main`.
+`packages/hyperevm/.dev/rank.ts` fetches the source lists, merges them with `packages/hyperevm/registry/nodes.json`, probes every HTTP URL, appends the observations to `packages/hyperevm/registry/history.json`, and writes ranks back. The workflow `.github/workflows/rank-registry.yml` runs that weekly and on demand, then opens a pull request. It does not push to `main`.
 
 A probe is `eth_chainId`, `eth_blockNumber`, `eth_call` to the zero address, and `eth_getLogs` for a single block filtered to an address that should have no logs. The chain id must be 999. A higher head from a node on the wrong chain is ignored.
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { isIdempotentMethod, shouldFailover } from "../src/methods.ts";
+import { isIdempotentMethod, shouldFailover } from "../../src/transport/_methods.ts";
 
 describe("method safety", () => {
   test("transaction sends and subscriptions are not idempotent", () => {

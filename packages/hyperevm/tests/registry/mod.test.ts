@@ -2,12 +2,12 @@ import { describe, expect, test } from "bun:test";
 
 import { readFileSync } from "node:fs";
 
-import { assertRegistryFile, defaultRegistry, registryHttpEndpoints } from "../src/registry.ts";
-import { normalizeRpcUrl } from "../src/url.ts";
+import { assertRegistryFile, defaultRegistry, registryHttpEndpoints } from "../../src/registry/mod.ts";
+import { normalizeRpcUrl } from "../../src/registry/_url.ts";
 
 describe("shipped registry", () => {
   test("matches the schema invariants and the HTTP pool", () => {
-    const text = readFileSync(new URL("../registry/nodes.json", import.meta.url), "utf8");
+    const text = readFileSync(new URL("../../registry/nodes.json", import.meta.url), "utf8");
     const parsed: unknown = JSON.parse(text);
     assertRegistryFile(parsed);
     expect(defaultRegistry.chainId).toBe(999);

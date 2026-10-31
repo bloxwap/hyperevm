@@ -4,7 +4,7 @@
  * @module
  */
 
-import type { ProbeObservation } from "../src/policy.ts";
+import type { ProbeObservation } from "../src/registry/_policy.ts";
 
 const EXPECTED_CHAIN_ID = 999;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";

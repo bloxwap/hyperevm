@@ -3,7 +3,7 @@
  * @module
  */
 
-import raw from "../registry/nodes.json" with { type: "json" };
+import raw from "../../registry/nodes.json" with { type: "json" };
 
 import {
   type RankPolicy,
@@ -12,8 +12,8 @@ import {
   type Submission,
   type Tracking,
   defaultRankPolicy,
-} from "./policy.ts";
-import { isWanchainHost } from "./url.ts";
+} from "./_policy.ts";
+import { isWanchainHost } from "./_url.ts";
 
 /** On-disk registry document. Version 1 is the only shape this package reads. */
 export interface RegistryFile {

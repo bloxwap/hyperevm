@@ -9,8 +9,8 @@ import {
 } from "viem";
 import { hyperEvm } from "viem/chains";
 
-import { AllEndpointsFailedError } from "../src/errors.ts";
-import { hyperevm, type HyperevmTransportOptions } from "../src/transport.ts";
+import { AllEndpointsFailedError } from "../../src/_errors.ts";
+import { hyperevm, type HyperevmTransportOptions } from "../../src/transport/mod.ts";
 
 interface MockEndpoint {
   transport: Transport;

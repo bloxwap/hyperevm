@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { isWanchainHost, normalizeRpcUrl } from "../src/url.ts";
+import { isWanchainHost, normalizeRpcUrl } from "../../src/registry/_url.ts";
 import {
   extractObjectBlock,
   parseChainlistChainFile,
   parseChainlistExtraRpcs,
   parseRpcPage,
-} from "../scripts/sources.ts";
+} from "../../.dev/sources.ts";
 
 const CHAIN_URL = "https://example.test/chainid-999.js";
 
