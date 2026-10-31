@@ -23,7 +23,7 @@
  * @module
  */
 
-export { AllEndpointsFailedError, TimeoutError } from "./_errors.ts";
+export { AllEndpointsFailedError, TimeoutError, TransportClosedError } from "./_errors.ts";
 export {
   HYPEREVM_CHAIN_ID,
   assertRegistryFile,
