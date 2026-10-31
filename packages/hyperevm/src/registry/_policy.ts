@@ -361,3 +361,17 @@ export function rankRegistry(
       return a.rank - b.rank;
     });
 }
+
+/**
+ * Why `next` must not replace `previous`, or undefined when it may.
+ * A run can pass every chain and head check and still leave no endpoint eligible, for example when each
+ * HyperCore read probe fails at once. Writing that registry would make the default transport throw.
+ */
+export function refuseRegistryRewrite(
+  previous: readonly RegistryEndpoint[],
+  next: readonly RegistryEndpoint[],
+): string | undefined {
+  if (!previous.some((endpoint) => endpoint.eligible)) return undefined;
+  if (next.some((endpoint) => endpoint.eligible)) return undefined;
+  return "Ranking left no endpoint eligible. Refusing to replace a registry that had eligible endpoints.";
+}

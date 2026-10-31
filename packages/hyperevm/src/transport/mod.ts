@@ -265,6 +265,8 @@ interface BuiltEndpoint {
   weight: number;
   request: (args: { method: string; params?: unknown }, options?: { signal?: AbortSignal }) => Promise<unknown>;
   supports: (method: string) => boolean;
+  /** Milliseconds a recent rate-limited HTTP response asked for in `Retry-After`. Reading it clears it. */
+  retryAfter: () => number;
 }
 
 interface Inflight {
@@ -470,13 +472,20 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
 
     const byId = new Map(built.map((endpoint) => [endpoint.id, endpoint]));
 
-    /** A healthy answer, including a terminal error, closes the circuit. */
-    const closeCircuit = (endpoint: RankedEndpoint): void => {
+    /**
+     * A healthy answer, including a terminal error, closes the circuit.
+     * A head probe or chain check (`call` false) cannot end an ejection early: a node that rate-limits
+     * expensive reads can still answer `eth_blockNumber`.
+     */
+    const closeCircuit = (endpoint: RankedEndpoint, call: boolean): void => {
+      if (!call && breaker.isOpen(endpoint.id)) return;
       if (breaker.success(endpoint.id)) emit({ type: "restore", endpoint: endpoint.url });
     };
 
     const openCircuit = (endpoint: RankedEndpoint, error: Error): void => {
-      const ejection = breaker.failure(endpoint.id, retryAfterMs(error, Date.now()));
+      // viem drops the headers of an HTTP 429 that carries a JSON-RPC error, so the endpoint keeps its own copy.
+      const asked = Math.max(retryAfterMs(error, Date.now()), byId.get(endpoint.id)?.retryAfter() ?? 0);
+      const ejection = breaker.failure(endpoint.id, asked);
       if (!ejection) return;
       emit({
         type: "eject",
@@ -491,19 +500,31 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
      * Resolve to undefined once `endpoint` has reported the expected chain id, or to the reason it cannot serve yet.
      * The check bypasses `start()`, so it never writes a latency sample. A failed check counts as a failed probe
      * (liveness only) and is retried on the next call. A wrong chain quarantines the endpoint for good.
+     *
+     * Concurrent callers share one check, but each waits under its own deadline. On Workers the invocation that
+     * started the check can end and take its I/O and timer with it, so the shared promise may never settle.
+     * A caller whose deadline passes drops the stuck check, and the next caller starts a fresh one.
      */
     const checkChain = (endpoint: BuiltEndpoint): Promise<Error | undefined> => {
       const gate = gates.get(endpoint.id);
       if (!gate || gate.verified) return Promise.resolve(undefined);
       if (gate.mismatch) return Promise.resolve(gate.mismatch);
-      if (gate.pending) return gate.pending;
+      const pending = gate.pending ?? startCheck(endpoint, gate);
+      return withDeadline(pending, timeout).catch((error: unknown): Error => {
+        if (gate.pending === pending) gate.pending = undefined;
+        return toError(error);
+      });
+    };
+
+    /** Send one `eth_chainId` for `endpoint` and record it as the gate's shared check. */
+    const startCheck = (endpoint: BuiltEndpoint, gate: ChainGate): Promise<Error | undefined> => {
       const started = now();
       const pending = withDeadline(endpoint.request({ method: "eth_chainId" }), timeout).then(
         (result): Error | undefined => {
           const chainId = parseQuantity(result);
           if (chainId === expectedChainId) {
             gate.verified = true;
-            closeCircuit(endpoint);
+            closeCircuit(endpoint, false);
             return undefined;
           }
           if (chainId === null) return new Error(`${endpoint.url} returned no chain id.`);
@@ -530,10 +551,11 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     };
 
     /**
-     * `board.pick`, skipping endpoints whose chain check fails.
-     * A skipped endpoint is excluded for this call and its reason joins `errors`, so it never costs an attempt.
+     * `board.pick` when the pick has passed its chain check. Otherwise a promise that settles once the check does,
+     * to true when it failed. The caller then picks again, so a verified pick is always synchronous and concurrent
+     * calls see each other's in-flight counts: cold calls that all waited on one check spread out afterwards.
+     * A failed check excludes the endpoint for this call and its reason joins `errors`, so it never costs an attempt.
      * After a failed check, an ejected endpoint is not checked next, so a storm costs one check per call.
-     * A verified pick returns synchronously, so concurrent calls still see each other's in-flight counts.
      */
     const pickVerified = (
       method: string,
@@ -541,8 +563,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       mode: "best" | "p2c",
       parent: AbortSignal | undefined,
       errors: Error[],
-      skipEjected = false,
-    ): RankedEndpoint | undefined | Promise<RankedEndpoint | undefined> => {
+      skipEjected: boolean,
+    ): RankedEndpoint | undefined | Promise<boolean> => {
       const endpoint = board.pick(method, exclude, mode, random);
       if (!endpoint) {
         if (errors.length === 0) {
@@ -554,19 +576,11 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       const target = byId.get(endpoint.id);
       if (!target || gates.get(endpoint.id)?.verified !== false) return endpoint;
       return untilAborted(checkChain(target), parent).then((reason) => {
-        if (!reason) return endpoint;
+        if (!reason) return false;
         exclude.add(endpoint.id);
         errors.push(reason);
-        return pickVerified(method, exclude, mode, parent, errors, true);
+        return true;
       });
-    };
-
-    /** `exclude` plus every endpoint that has not passed its chain check. Hedges never wait on a check. */
-    const verifiedOnly = (exclude: ReadonlySet<string>): ReadonlySet<string> => {
-      if (!verifyChainId) return exclude;
-      const blocked = new Set(exclude);
-      for (const [id, gate] of gates) if (!gate.verified) blocked.add(id);
-      return blocked;
     };
 
     const start = (
@@ -630,7 +644,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
                 });
               }
               emit({ type: "success", endpoint: endpoint.url, method, latencyMs, hedged });
-              closeCircuit(endpoint);
+              closeCircuit(endpoint, sampleLatency);
             }
             return outcome.result;
           }
@@ -645,7 +659,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
               board.failure(endpoint.id, method, latencyMs, sampleLatency, timeout);
             }
             emit({ type: "error", endpoint: endpoint.url, method, latencyMs, error: wrapped, terminal });
-            if (terminal) closeCircuit(endpoint);
+            if (terminal) closeCircuit(endpoint, sampleLatency);
             else openCircuit(endpoint, wrapped);
           }
           throw wrapped;
@@ -681,12 +695,24 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       let previous: RankedEndpoint | undefined;
       let round = 0;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
-        // A verified pick is synchronous, so `start()` counts it in flight before any other call picks.
-        const picked = pickVerified(method, exclude, attempt === 0 ? routing : "best", parent, errors);
-        let endpoint = picked instanceof Promise ? await picked : picked;
         let wait = attempt > 0 ? retryDelay : 0;
-        if (!endpoint && exclude.size > 0) {
-          // Every eligible endpoint failed this call, or failed its chain check. Start another round after a backoff.
+        let mode = attempt === 0 ? routing : "best";
+        let endpoint: RankedEndpoint | undefined;
+        for (let backedOff = false; ; ) {
+          // Waiting out a chain check is followed by a fresh pick. The last pick is synchronous, so
+          // `start()` counts it in flight before any other call picks.
+          let skipEjected = false;
+          let picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
+          while (picked instanceof Promise) {
+            skipEjected = (await picked) || skipEjected;
+            picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
+          }
+          endpoint = picked;
+          // Failing over into an ejected endpoint amplifies an outage. A new round goes back to the
+          // endpoints that failed once instead, and stops if only ejected ones are left.
+          if (!backedOff && endpoint && attempt > 0 && breaker.isOpen(endpoint.id)) endpoint = undefined;
+          if (endpoint || backedOff || exclude.size === 0) break;
+          // Every usable endpoint failed this call, or failed its chain check. Start another round after a backoff.
           exclude.clear();
           const candidate = board.pick(method, exclude, "best", random);
           if (!candidate) break;
@@ -695,10 +721,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
           await delay(Math.max(backoffMs(round, retryBackoff, random), ejectedMs), parent);
           round += 1;
           wait = 0;
-          endpoint = await pickVerified(method, exclude, "best", parent, errors);
-        } else if (endpoint && attempt > 0 && breaker.isOpen(endpoint.id)) {
-          // Only ejected endpoints are left. Failing over into them amplifies an outage.
-          break;
+          mode = "best";
+          backedOff = true;
         }
         if (!endpoint) break;
         exclude.add(endpoint.id);
@@ -737,12 +761,21 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       const primary = start(endpoint, method, params, parent, false, true);
       if (!hedge.enabled || !idempotent) return primary.promise;
       const wait = board.hedgeDelay(endpoint.id, method, hedge.minDelay, hedge.multiplier);
-      return raceHedge(primary, wait, () => {
-        const next = board.pick(method, verifiedOnly(exclude), "best", random);
+      return raceHedge(primary, wait, (active) => {
+        const next = board.pick(method, exclude, "best", random);
         if (!next || breaker.isOpen(next.id)) return undefined;
-        emit({ type: "hedge", endpoint: next.url, method });
         exclude.add(next.id);
-        return start(next, method, params, parent, true, true);
+        const launch = (): Inflight => {
+          emit({ type: "hedge", endpoint: next.url, method });
+          return start(next, method, params, parent, true, true);
+        };
+        const target = byId.get(next.id);
+        if (!target || gates.get(next.id)?.verified !== false) return launch();
+        // An unverified backup is checked now. With probes off, nothing else would ever check it for a hedge.
+        return untilAborted(checkChain(target), parent).then(
+          (reason) => (reason || !active() ? undefined : launch()),
+          () => undefined,
+        );
       });
     };
 
@@ -750,15 +783,18 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
 
     const probe = (): Promise<void> => {
       if (closed) return Promise.resolve();
+      // An ejected endpoint is left alone until its cooldown ends. The provider may have asked for the quiet.
       const pending = built.map((endpoint) =>
-        checkChain(endpoint).then((reason) =>
-          reason
-            ? undefined
-            : start(endpoint, "eth_blockNumber", [], undefined, false, false).promise.then(
-                () => undefined,
-                () => undefined,
-              ),
-        ),
+        breaker.isOpen(endpoint.id)
+          ? Promise.resolve()
+          : checkChain(endpoint).then((reason) =>
+              reason
+                ? undefined
+                : start(endpoint, "eth_blockNumber", [], undefined, false, false).promise.then(
+                    () => undefined,
+                    () => undefined,
+                  ),
+            ),
       );
       return Promise.all(pending).then(() => undefined);
     };
@@ -833,21 +869,39 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
   };
 }
 
-function raceHedge(primary: Inflight, waitMs: number, startHedge: () => Inflight | undefined): Promise<unknown> {
+/**
+ * Settle with the first of `primary` and a hedge started after `waitMs`.
+ * `startHedge` may return a promise while it checks the backup. It gets a function that is true until the race settles.
+ */
+function raceHedge(
+  primary: Inflight,
+  waitMs: number,
+  startHedge: (active: () => boolean) => Inflight | undefined | Promise<Inflight | undefined>,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let pending = 1;
     let settled = false;
     let hedge: Inflight | undefined;
     let primaryError: Error | undefined;
+    const track = (call: Inflight | undefined): void => {
+      if (!call) {
+        // The backup never started. Only the primary's outcome is left.
+        fail(undefined, new Error("The hedge did not start."), false);
+        return;
+      }
+      hedge = call;
+      call.promise.then(
+        (result) => finish(result, primary),
+        (error: unknown) => fail(call, toError(error), false),
+      );
+    };
     const timer = setTimeout(() => {
       if (settled) return;
-      hedge = startHedge();
-      if (!hedge) return;
+      const started = startHedge(() => !settled);
+      if (started === undefined) return;
       pending += 1;
-      hedge.promise.then(
-        (result) => finish(result, primary),
-        (error: unknown) => fail(hedge, toError(error), false),
-      );
+      if (started instanceof Promise) started.then(track, () => track(undefined));
+      else track(started);
     }, waitMs);
 
     const finish = (result: unknown, loser: Inflight | undefined): void => {
@@ -943,6 +997,34 @@ interface PendingEndpoint {
   instance: ReturnType<Transport>;
   /** Spellings of the URL to scrub from errors. */
   secrets: string[];
+  hint: RetryHint;
+}
+
+/**
+ * The latest `Retry-After` on a 429 or 503 from one URL endpoint.
+ * viem turns such a response into an RPC error without its headers when the body is a JSON-RPC error.
+ */
+interface RetryHint {
+  /** viem `onFetchResponse`. */
+  record: (response: Response) => void;
+  /** Milliseconds left of the recorded wait. Clears it. */
+  take: () => number;
+}
+
+function retryHint(): RetryHint {
+  let until = 0;
+  return {
+    record(response: Response): void {
+      if (response.status !== 429 && response.status !== 503) return;
+      const asked = retryAfterMs({ headers: response.headers }, Date.now());
+      if (asked > 0) until = Math.max(until, Date.now() + asked);
+    },
+    take(): number {
+      const left = Math.max(0, until - Date.now());
+      until = 0;
+      return left;
+    },
+  };
 }
 
 function buildEndpoints(options: HyperevmTransportOptions, chain: Chain | undefined, timeout: number): BuiltEndpoint[] {
@@ -955,7 +1037,8 @@ function buildEndpoints(options: HyperevmTransportOptions, chain: Chain | undefi
   inputs.forEach((input, index) => {
     const config = endpointConfig(input, index);
     const given = config.url === undefined ? undefined : endpointUrlAt(config.url, index);
-    const transport = given ? toChildTransport(given, options, timeout) : config.transport;
+    const hint = retryHint();
+    const transport = given ? toChildTransport(given, options, timeout, hint) : config.transport;
     if (!transport) throw new Error(`hyperevm() endpoints[${index}] needs a url or a transport.`);
     const instance = transport({ chain, retryCount: 0, timeout });
     const childUrl = given ? undefined : endpointUrl(instance.value);
@@ -982,6 +1065,7 @@ function buildEndpoints(options: HyperevmTransportOptions, chain: Chain | undefi
       weight,
       instance,
       secrets: secrets.filter((secret): secret is string => secret !== undefined),
+      hint,
     });
   });
   return pending.map((entry) => {
@@ -994,6 +1078,7 @@ function buildEndpoints(options: HyperevmTransportOptions, chain: Chain | undefi
       weight: entry.weight,
       supports: (method: string): boolean => supportsMethod(methods, method),
       request: redactErrors(instance.request as BuiltEndpoint["request"], entry.secrets, label),
+      retryAfter: entry.hint.take,
     };
   });
 }
@@ -1071,23 +1156,33 @@ function redactErrors(
   };
 }
 
+/**
+ * Scrub every string `error` holds, in place: its own properties and cause, and the plain objects and arrays
+ * under them. viem keeps the provider's JSON-RPC error, `data` included, as a plain-object cause.
+ */
 function scrubError(error: unknown, scrub: (text: string) => string): void {
-  let current: unknown = error;
-  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
-    for (const key of Object.getOwnPropertyNames(current)) {
-      const value: unknown = Reflect.get(current, key);
-      if (typeof value === "string") {
-        Reflect.set(current, key, scrub(value));
-      } else if (Array.isArray(value)) {
-        Reflect.set(
-          current,
-          key,
-          value.map((item: unknown) => (typeof item === "string" ? scrub(item) : item)),
-        );
+  const seen = new Set<object>();
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 8 || typeof value !== "object" || value === null || seen.has(value)) return;
+    if (!(value instanceof Error) && !Array.isArray(value) && !isPlainObject(value)) return;
+    seen.add(value);
+    const keys = value instanceof Error ? new Set([...Object.getOwnPropertyNames(value), "cause"]) : Object.keys(value);
+    for (const key of keys) {
+      const item: unknown = Reflect.get(value, key);
+      if (typeof item === "string") {
+        const scrubbed = scrub(item);
+        if (scrubbed !== item) Reflect.set(value, key, scrubbed);
+      } else {
+        visit(item, depth + 1);
       }
     }
-    current = current.cause;
-  }
+  };
+  visit(error, 0);
+}
+
+function isPlainObject(value: object): boolean {
+  const prototype: unknown = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 /** The URL as viem prints it in errors, with basic-auth credentials removed. */
@@ -1103,11 +1198,17 @@ function withoutCredentials(url: string): string {
   }
 }
 
-function toChildTransport(url: EndpointUrl, options: HyperevmTransportOptions, timeout: number): Transport {
+function toChildTransport(
+  url: EndpointUrl,
+  options: HyperevmTransportOptions,
+  timeout: number,
+  hint: RetryHint,
+): Transport {
   if (url.kind === "websocket") return webSocket(url.url);
   return http(url.url, {
     batch: options.batch,
     fetchFn: options.fetchFn,
+    onFetchResponse: hint.record,
     retryCount: 0,
     timeout,
   });

@@ -31,13 +31,14 @@ function mockFetch(handler: (url: string, body: RpcBody, seen: number) => Reply)
     calls.push({ url, method: body.method });
     const reply = handler(url, body, seen);
     const status = reply.status ?? 200;
-    if (status !== 200) return new Response("rate limited", { status, headers: reply.headers });
+    if (status !== 200 && reply.error === undefined)
+      return new Response("rate limited", { status, headers: reply.headers });
     const payload =
       reply.error === undefined
         ? { jsonrpc: "2.0", id: body.id, result: reply.result }
         : { jsonrpc: "2.0", id: body.id, error: reply.error };
     return new Response(JSON.stringify(payload), {
-      status: 200,
+      status,
       headers: { "content-type": "application/json", ...reply.headers },
     });
   };
@@ -355,5 +356,124 @@ describe("raw transaction rebroadcast", () => {
     const hedged = open({ endpoints: [slow.transport, fast.transport], hedge: { minDelay: 10, multiplier: 0 } });
     expect(await hedged.request({ method: "eth_sendRawTransaction", params: [RAW_TX] })).toBe("0xslow");
     expect(fast.calls).toHaveLength(0);
+  });
+});
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Run `fn` with `setTimeout` dropping every timer, as when Workers cancels the invocation that set them. */
+function withoutTimers<T>(fn: () => T): T {
+  const original = globalThis.setTimeout;
+  globalThis.setTimeout = ((): number => 0) as unknown as typeof setTimeout;
+  try {
+    return fn();
+  } finally {
+    globalThis.setTimeout = original;
+  }
+}
+
+describe("chain checks under concurrency", () => {
+  test("a shared check stuck in a cancelled invocation does not hang other calls", async () => {
+    const node = mockEndpoint("node", (method, seen) => {
+      if (method === "eth_chainId") return seen === 0 ? hang() : "0x3e7";
+      return "0x1";
+    });
+    const client = open({ endpoints: [node.transport], verifyChainId: true, timeout: 50 });
+    const first = withoutTimers(() => client.request({ method: "eth_blockNumber" }));
+    void first.catch(() => undefined);
+    const concurrent = client.request({ method: "eth_blockNumber" });
+    expect(await Promise.race([concurrent, sleep(500).then(() => "hung")])).toBe("0x1");
+    const later = client.request({ method: "eth_blockNumber" });
+    expect(await Promise.race([later, sleep(500).then(() => "hung")])).toBe("0x1");
+  });
+
+  test("concurrent cold calls spread across endpoints once their checks pass", async () => {
+    const node = (name: string): MockEndpoint =>
+      mockEndpoint(name, async (method) => {
+        await sleep(method === "eth_chainId" ? 5 : 20);
+        return method === "eth_chainId" ? "0x3e7" : "0x1";
+      });
+    const nodes = [node("a"), node("b"), node("c")];
+    const client = open({ endpoints: nodes.map((item) => item.transport), verifyChainId: true });
+    await Promise.all(Array.from({ length: 12 }, () => client.request({ method: "eth_call", params: [] })));
+    const reads = nodes.map((item) => item.calls.filter((call) => call.method === "eth_call").length);
+    expect(reads.reduce((sum, count) => sum + count, 0)).toBe(12);
+    expect(Math.max(...reads)).toBeLessThanOrEqual(6);
+  });
+
+  test("a hedge checks an unverified backup instead of skipping it", async () => {
+    const slow = mockEndpoint("slow", async (method) => {
+      if (method === "eth_chainId") return "0x3e7";
+      await sleep(150);
+      return "0xslow";
+    });
+    const fast = mockEndpoint("fast", (method) => (method === "eth_chainId" ? "0x3e7" : "0xfast"));
+    const client = open({
+      endpoints: [slow.transport, fast.transport],
+      verifyChainId: true,
+      hedge: { minDelay: 5, multiplier: 2 },
+    });
+    const started = Date.now();
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0xfast");
+    expect(Date.now() - started).toBeLessThan(120);
+    expect(fast.calls.map((call) => call.method)).toEqual(["eth_chainId", "eth_call"]);
+  });
+});
+
+describe("breaker interactions", () => {
+  test("a JSON-RPC rate limit on an HTTP 429 keeps its Retry-After", async () => {
+    const events: HyperevmEvent[] = [];
+    const rpc = mockFetch(() => ({
+      status: 429,
+      error: { code: -32005, message: "rate limited" },
+      headers: { "retry-after": "30" },
+    }));
+    const client = open({ endpoints: [A], fetchFn: rpc.fetchFn, onEvent: (event) => events.push(event) });
+    await expect(client.request({ method: "eth_call", params: [] })).rejects.toThrow();
+    expect(rpc.calls).toHaveLength(1);
+    const eject = events.find((event) => event.type === "eject");
+    expect(eject).toMatchObject({ type: "eject", endpoint: label(A), failures: 1 });
+    // The wait counts from the response, so a millisecond may pass before the failure is recorded.
+    expect(eject?.type === "eject" && eject.cooldownMs > 29_000).toBe(true);
+  });
+
+  test("a head probe does not end an ejection early", async () => {
+    const events: HyperevmEvent[] = [];
+    const rpc = mockFetch((url, body) =>
+      url === A && body.method === "eth_call"
+        ? { status: 429, headers: { "retry-after": "30" } }
+        : { result: body.method === "eth_blockNumber" ? "0x10" : "0x1" },
+    );
+    const client = open({ endpoints: [A, B], fetchFn: rpc.fetchFn, onEvent: (event) => events.push(event) });
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    await client.value?.probe();
+    expect(events.some((event) => event.type === "restore")).toBe(false);
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    expect(rpc.calls.filter((call) => call.url === A)).toEqual([{ url: A, method: "eth_call" }]);
+  });
+
+  test("an ejected backup does not stop a re-try on the endpoint that failed once", async () => {
+    const rpc = mockFetch((url, _body, seen) => {
+      if (url === B) return { status: 429, headers: { "retry-after": "30" } };
+      return seen === 1 ? { status: 503 } : { result: "0x1" };
+    });
+    const client = open({ endpoints: [B, A], fetchFn: rpc.fetchFn });
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    expect(rpc.calls.map((call) => call.url)).toEqual([B, A, A, A]);
+  });
+});
+
+describe("filter polling", () => {
+  test("eth_getFilterChanges is never re-sent after a lost response", async () => {
+    const node = mockEndpoint("node", (_method, seen) => {
+      if (seen === 0) throw new Error("socket hang up");
+      return [];
+    });
+    const client = open({ endpoints: [node.transport] });
+    await expect(client.request({ method: "eth_getFilterChanges", params: ["0x1"] })).rejects.toThrow(/socket hang up/);
+    expect(node.calls).toHaveLength(1);
   });
 });

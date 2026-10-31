@@ -37,19 +37,21 @@ The timer starts on the first request, not when the transport is built, and stop
 
 ## Chain id
 
-Unless `verifyChainId` is false, each endpoint answers one `eth_chainId` before its first call or probe. The expected id is the client chain, or 999. The check does not write a latency sample. A wrong id quarantines the endpoint for the life of the instance: no call, hedge, or probe goes to it, a `quarantine` event fires, and its snapshot shows `quarantined: true`. If every endpoint is quarantined the call throws `ChainMismatchError`. A network error or rate limit on the check does not quarantine. It counts toward the breaker like any endpoint failure, the call moves to another endpoint without spending an attempt, and the check runs again on the next call.
+Unless `verifyChainId` is false, each endpoint answers one `eth_chainId` before its first call or probe. The expected id is the client chain, or 999. The check does not write a latency sample. A wrong id quarantines the endpoint for the life of the instance: no call, hedge, or probe goes to it, a `quarantine` event fires, and its snapshot shows `quarantined: true`. If every endpoint is quarantined the call throws `ChainMismatchError`. A network error or rate limit on the check does not quarantine. It counts toward the breaker like any endpoint failure, the call moves to another endpoint without spending an attempt, and the check runs again on the next call. Concurrent calls share one check, and each waits under its own `timeout`. On Workers, the request that started a check can end and take the check with it, so a call that times out waiting drops the check and the next call starts a new one. A call that waited on a check picks again once it passes, so a burst of cold calls spreads over the endpoints instead of piling onto the first one checked.
 
 ## Circuit breaker
 
-Three consecutive endpoint failures eject an endpoint for 5 seconds. Each later ejection doubles that, up to 60 seconds. A `Retry-After` header (seconds or an HTTP date) ejects it at once for the time asked, capped at 60 seconds. Any healthy answer, including a revert or another terminal error, closes the circuit and fires `restore`.
+Three consecutive endpoint failures eject an endpoint for 5 seconds. Each later ejection doubles that, up to 60 seconds. A `Retry-After` header (seconds or an HTTP date) ejects it at once for the time asked, capped at 60 seconds. For URL endpoints this includes a 429 or 503 whose body is a JSON-RPC error, where viem drops the headers. A viem transport you pass in keeps only what viem's error carries. Any healthy answer to a call, including a revert or another terminal error, closes the circuit and fires `restore`. A head probe or chain check does not end an ejection early.
 
-Routing skips ejected endpoints while any other candidate is left. When every endpoint is ejected, the first attempt of a call still goes to the best one, so a call always has somewhere to go. After a failure, a call does not fail over into an ejected endpoint, and hedges never target one. Probes still reach ejected endpoints, so a recovered node comes back on its next probe. With three endpoints all returning 429, ten calls cost 16 upstream requests instead of 30, or 17 counting the chain checks. Set `breaker: false` to turn it off, or pass `{ threshold, cooldown, maxCooldown }`.
+Routing skips ejected endpoints while any other candidate is left. When every endpoint is ejected, the first attempt of a call still goes to the best one, so a call always has somewhere to go. After a failure, a call does not fail over into an ejected endpoint, and hedges never target one. If only ejected endpoints are left, the call starts another round on the endpoints that already failed it instead, as long as they are not ejected. Probes skip ejected endpoints until the cooldown ends, so a provider that asked for 30 seconds gets them. With three endpoints all returning 429, ten calls cost 16 upstream requests instead of 30, or 17 counting the chain checks. Set `breaker: false` to turn it off, or pass `{ threshold, cooldown, maxCooldown }`.
 
 ## What is not retried
 
 These methods go to one endpoint and are never hedged:
 
-`eth_sendTransaction`, `eth_sign`, `eth_signTransaction`, `eth_signTypedData`, `eth_signTypedData_v3`, `eth_signTypedData_v4`, `personal_sign`, `personal_sendTransaction`, `eth_submitWork`, `eth_submitHashrate`, `wallet_sendTransaction`, `wallet_sendCalls`, `eth_subscribe`.
+`eth_sendTransaction`, `eth_sign`, `eth_signTransaction`, `eth_signTypedData`, `eth_signTypedData_v3`, `eth_signTypedData_v4`, `personal_sign`, `personal_sendTransaction`, `eth_submitWork`, `eth_submitHashrate`, `wallet_sendTransaction`, `wallet_sendCalls`, `eth_subscribe`, `eth_getFilterChanges`.
+
+`eth_getFilterChanges` returns what changed since the previous poll and consumes it, so re-sending a poll whose response was lost would answer `[]` and drop those changes.
 
 Pass more names in `nonIdempotentMethods`.
 
@@ -59,7 +61,7 @@ Failover stops on execution reverts, invalid params, invalid requests, parse err
 
 Each endpoint is tried once before any is tried again. Once every eligible endpoint has failed a call and attempts remain, the call waits a jittered exponential backoff and starts another round. The base is `retryDelay`, or 100ms when it is 0. Each wait is half to all of `base * 2^round`, capped at 2 seconds, and at least the ejection left on the endpoint it will try. A call stops rather than wait out a longer ejection. With the default `retryCount`, a single endpoint survives one 429.
 
-Hedging is off unless you set `hedge`. When it is on, an idempotent read that is still running after `max(minDelay, multiplier * tail)` is copied to the next endpoint. The first success wins. Cancelling the loser does not count as an error. Hedges only go to endpoints that passed the chain check and are not ejected.
+Hedging is off unless you set `hedge`. When it is on, an idempotent read that is still running after `max(minDelay, multiplier * tail)` is copied to the next endpoint. The first success wins. Cancelling the loser does not count as an error. Hedges never go to an ejected endpoint. A backup that has not passed its chain check is checked first, then hedged if the read is still running, so hedging works with probes off.
 
 ## Registry score
 
@@ -84,7 +86,7 @@ WebSocket URLs are stored and are not part of the default HTTP pool. The transpo
 
 Community submissions (see [CONTRIBUTING.md](../CONTRIBUTING.md)) stay in the file when upstream lists stop mentioning them. An upstream URL that disappears from every source is removed on the next successful run.
 
-If a source list fails to download, the script exits and does not write. If a registry that already had eligible endpoints gets a run where nobody returns chain id 999, the script also refuses to write. One bad network day must not empty the pool.
+If a source list fails to download, the script exits and does not write. If a registry that already had eligible endpoints gets a run where nobody returns chain id 999, or a ranking that leaves no endpoint eligible (for example when every HyperCore read probe fails at once), the script also refuses to write. One bad network day must not empty the pool.
 
 ## Sources
 

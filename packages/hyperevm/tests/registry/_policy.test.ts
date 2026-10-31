@@ -6,6 +6,7 @@ import {
   mergeEndpointInputs,
   PRECOMPILE_PROBE,
   rankRegistry,
+  refuseRegistryRewrite,
   type ProbeObservation,
   type RegistryEndpointInput,
 } from "../../src/registry/_policy.ts";
@@ -39,6 +40,18 @@ function observation(url: string, daysAgo: number, ms: number, ok = true, chainI
       eth_getLogs: { ms: ms + 50, ok },
     },
   };
+}
+
+function withProbes(
+  url: string,
+  daysAgo: number,
+  probes: { precompile?: boolean; range?: boolean },
+  ms = 40,
+): ProbeObservation {
+  const sample = observation(url, daysAgo, ms);
+  if (probes.precompile !== undefined) sample.methods[PRECOMPILE_PROBE] = { ms, ok: probes.precompile };
+  if (probes.range !== undefined) sample.methods[LOGS_RANGE_PROBE] = { ms: ms + 100, ok: probes.range };
+  return sample;
 }
 
 describe("rankRegistry", () => {
@@ -151,18 +164,6 @@ describe("rankRegistry", () => {
 });
 
 describe("rankRegistry HyperCore and log range probes", () => {
-  function withProbes(
-    url: string,
-    daysAgo: number,
-    probes: { precompile?: boolean; range?: boolean },
-    ms = 40,
-  ): ProbeObservation {
-    const sample = observation(url, daysAgo, ms);
-    if (probes.precompile !== undefined) sample.methods[PRECOMPILE_PROBE] = { ms, ok: probes.precompile };
-    if (probes.range !== undefined) sample.methods[LOGS_RANGE_PROBE] = { ms: ms + 100, ok: probes.range };
-    return sample;
-  }
-
   test("an endpoint whose latest precompile probe failed is listed but kept out of the default pool", () => {
     const url = "https://no-core.example/evm";
     const observations = [20, 10, 1].map((daysAgo) => withProbes(url, daysAgo, { precompile: false, range: true }));
@@ -314,5 +315,30 @@ describe("mergeEndpointInputs", () => {
     expect(community?.addedAt).toBe("2026-02-01T00:00:00.000Z");
     expect(community?.sources.map((source) => source.name).sort()).toEqual(["chainlist", "community"]);
     expect(merged.find((item) => item.url === "https://fresh.example/evm")?.addedAt).toBe("2026-10-30T00:00:00.000Z");
+  });
+});
+
+describe("refuseRegistryRewrite", () => {
+  test("refuses a ranking that leaves no endpoint eligible when the previous registry had some", () => {
+    const urls = ["https://a.example/evm", "https://b.example/evm"];
+    const healthy = rankRegistry(
+      urls.map((url) => endpoint(url)),
+      urls.map((url) => withProbes(url, 3, { precompile: true, range: true })),
+      NOW,
+    );
+    expect(healthy.every((row) => row.eligible)).toBe(true);
+    // Every node passes chain and head checks, but a transient blip fails each precompile probe at once.
+    const blip = rankRegistry(
+      urls.map((url) => endpoint(url)),
+      [
+        ...urls.map((url) => withProbes(url, 3, { precompile: true, range: true })),
+        ...urls.map((url) => withProbes(url, 0, { precompile: false, range: true })),
+      ],
+      NOW,
+    );
+    expect(blip.some((row) => row.eligible)).toBe(false);
+    expect(refuseRegistryRewrite(healthy, blip)).toMatch(/no endpoint eligible/i);
+    expect(refuseRegistryRewrite(healthy, healthy)).toBeUndefined();
+    expect(refuseRegistryRewrite(blip, blip)).toBeUndefined();
   });
 });

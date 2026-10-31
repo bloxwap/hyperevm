@@ -24,7 +24,7 @@ interface Seen {
   authorization: string | null;
 }
 
-type Reply = { result: unknown } | { error: { code: number; message: string } } | { status: number };
+type Reply = { result: unknown } | { error: { code: number; message: string; data?: unknown } } | { status: number };
 
 /** viem `fetchFn` that answers JSON-RPC from `reply` and records each call. */
 function rpcFetch(
@@ -79,18 +79,21 @@ function open(options: HyperevmTransportOptions, timeout = 1_000) {
   return hyperevm({ headLag: false, routing: "best", hedge: false, retryCount: 2, ...options })({ timeout });
 }
 
-/** Every string an error carries: message, stack, details, meta messages, url, and the same for its causes. */
+/** Every string an error holds at any depth: its own properties, its causes, and nested objects and arrays. */
 function errorText(error: unknown): string {
   const parts: string[] = [];
-  let current: unknown = error;
-  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
-    for (const key of Object.getOwnPropertyNames(current)) {
-      const value: unknown = Reflect.get(current, key);
-      if (typeof value === "string") parts.push(value);
-      if (Array.isArray(value)) parts.push(...value.filter((item): item is string => typeof item === "string"));
+  const seen = new Set<object>();
+  const visit = (value: unknown): void => {
+    if (typeof value === "string") {
+      parts.push(value);
+      return;
     }
-    current = current.cause;
-  }
+    if (typeof value !== "object" || value === null || seen.has(value)) return;
+    seen.add(value);
+    const keys = value instanceof Error ? [...Object.getOwnPropertyNames(value), "cause"] : Object.keys(value);
+    for (const key of keys) visit(Reflect.get(value, key));
+  };
+  visit(error);
   return parts.join("\n");
 }
 
@@ -215,6 +218,32 @@ describe("explicit endpoints that carry keys", () => {
     const text = [errorText(thrown), ...errors.map(errorText)].join("\n");
     expect(text).toContain("https://hyperpc.example.test");
     expect(text).toContain("Status: 500");
+    expectNoSecret(text);
+  });
+
+  test("a provider error that echoes the keyed URL is scrubbed at every depth", async () => {
+    const events: Error[] = [];
+    const client = open({
+      endpoints: [HYPERPC],
+      fetchFn: rpcFetch((url, method) =>
+        method === "eth_chainId"
+          ? healthy(url, method)
+          : { error: { code: -32000, message: `upstream ${HYPERPC} refused`, data: { endpoint: HYPERPC } } },
+      ),
+      retryCount: 0,
+      onEvent: (event) => {
+        if (event.type === "error") events.push(event.error);
+      },
+    });
+    let thrown: unknown;
+    try {
+      await client.request({ method: "eth_call", params: [] });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    const text = [errorText(thrown), ...events.map(errorText)].join("\n");
+    expect(text).toContain("upstream https://hyperpc.example.test refused");
     expectNoSecret(text);
   });
 });
