@@ -41,6 +41,8 @@ export type HyperevmEvent =
       head: number;
       best: number;
       lag: number;
+      /** False when this head is ignored as implausible, or no reference head is believed yet. */
+      trusted: boolean;
     };
 
 /** One endpoint as the transport currently scores it. */

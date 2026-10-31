@@ -25,7 +25,7 @@ import { normalizeRpcUrl } from "../registry/_url.ts";
 import type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
 import { isAbortError, isIdempotentMethod, shouldFailover, toError } from "./_methods.ts";
 import { type ScoreConfig, defaultScoreConfig } from "./_score.ts";
-import { type RankedEndpoint, Scoreboard, blockNumberFromResult } from "./_scoreboard.ts";
+import { DEFAULT_MAX_AHEAD, type RankedEndpoint, Scoreboard, blockNumberFromResult } from "./_scoreboard.ts";
 
 export type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
 export { NON_IDEMPOTENT_METHODS, isIdempotentMethod, shouldFailover } from "./_methods.ts";
@@ -54,6 +54,11 @@ export interface HeadLagOptions {
   probeInterval?: number | false | undefined;
   /** Heads older than this stop affecting the score. Default: 30000. */
   staleMs?: number | undefined;
+  /**
+   * Blocks a head may lead the median of the other endpoints' fresh heads.
+   * A head further ahead is ignored, and its endpoint is scored as if it lagged by as much as it leads. Default: 1000.
+   */
+  maxAhead?: number | undefined;
 }
 
 export interface HedgeOptions {
@@ -139,6 +144,7 @@ interface ResolvedHeadLag {
   maxLag: number;
   probeInterval: number | false;
   staleMs: number;
+  maxAhead: number;
 }
 
 interface ResolvedHedge {
@@ -163,7 +169,13 @@ interface Inflight {
 
 function resolveHeadLag(value: boolean | HeadLagOptions | undefined): ResolvedHeadLag {
   if (value === false) {
-    return { enabled: false, maxLag: DEFAULT_MAX_LAG, probeInterval: false, staleMs: DEFAULT_STALE_MS };
+    return {
+      enabled: false,
+      maxLag: DEFAULT_MAX_LAG,
+      probeInterval: false,
+      staleMs: DEFAULT_STALE_MS,
+      maxAhead: DEFAULT_MAX_AHEAD,
+    };
   }
   const options = value === true || value === undefined ? {} : value;
   return {
@@ -171,6 +183,7 @@ function resolveHeadLag(value: boolean | HeadLagOptions | undefined): ResolvedHe
     maxLag: options.maxLag ?? DEFAULT_MAX_LAG,
     probeInterval: options.probeInterval === undefined ? DEFAULT_PROBE_MS : options.probeInterval,
     staleMs: options.staleMs ?? DEFAULT_STALE_MS,
+    maxAhead: options.maxAhead ?? DEFAULT_MAX_AHEAD,
   };
 }
 
@@ -281,6 +294,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         headLag: headLag.enabled,
         maxLag: headLag.maxLag,
         staleMs: headLag.staleMs,
+        maxAhead: headLag.maxAhead,
         config: { ...defaultScoreConfig, ...options.score },
         now,
       },
@@ -352,10 +366,17 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
           if (outcome.kind === "result") {
             if (!state.ignore) {
               board.success(endpoint.id, method, latencyMs, sampleLatency);
-              const block = blockNumberFromResult(method, outcome.result);
+              const block = blockNumberFromResult(method, outcome.result, params);
               if (block !== null && headLag.enabled) {
                 const head = board.noteHead(endpoint.id, block);
-                emit({ type: "head", endpoint: endpoint.url, head: block, best: head.best, lag: head.lag });
+                emit({
+                  type: "head",
+                  endpoint: endpoint.url,
+                  head: block,
+                  best: head.best,
+                  lag: head.lag,
+                  trusted: head.trusted,
+                });
               }
               emit({ type: "success", endpoint: endpoint.url, method, latencyMs, hedged });
             }
