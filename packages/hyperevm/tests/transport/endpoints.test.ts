@@ -82,7 +82,7 @@ function open(options: HyperevmTransportOptions, timeout = 1_000) {
   return hyperevm({ headLag: false, routing: "best", hedge: false, retryCount: 2, ...options })({ timeout });
 }
 
-/** Every string an error holds at any depth: its own properties, its causes, nested objects and arrays, and headers. */
+/** Every string an error holds at any depth, property names included: its causes, nested objects and arrays, and headers. */
 function errorText(error: unknown): string {
   const parts: string[] = [];
   const seen = new Set<object>();
@@ -98,7 +98,10 @@ function errorText(error: unknown): string {
       return;
     }
     const keys = value instanceof Error ? [...Object.getOwnPropertyNames(value), "cause"] : Object.keys(value);
-    for (const key of keys) visit(Reflect.get(value, key));
+    for (const key of keys) {
+      parts.push(key);
+      visit(Reflect.get(value, key));
+    }
   };
   visit(error);
   return parts.join("\n");
@@ -297,6 +300,38 @@ describe("explicit endpoints that carry keys", () => {
     expect(leaf).toEqual({ endpoint: "https://hyperpc.example.test", revert: "0x08c379a0" });
     expect(events).toHaveLength(2);
     expectNoSecret([...thrown, ...events].map(errorText).join("\n"));
+  });
+
+  test("a keyed URL used as a property name in error data is scrubbed", async () => {
+    const events: Error[] = [];
+    const client = open({
+      endpoints: [HYPERPC],
+      verifyChainId: false,
+      retryCount: 0,
+      fetchFn: rpcFetch(() => ({
+        error: { code: -32000, message: "upstream refused", data: { first: 1, [HYPERPC]: "unavailable", last: 2 } },
+      })),
+      onEvent: (event) => {
+        if (event.type === "error") events.push(event.error);
+      },
+    });
+    let thrown: unknown;
+    try {
+      await client.request({ method: "eth_call", params: [] });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(InvalidInputRpcError);
+    expect(events).toHaveLength(1);
+    let request: unknown = thrown;
+    while (request instanceof Error && !(request instanceof RpcRequestError)) request = request.cause;
+    const data = (request as RpcRequestError).data as Record<string, unknown>;
+    expect(Object.entries(data)).toEqual([
+      ["first", 1],
+      ["https://hyperpc.example.test", "unavailable"],
+      ["last", 2],
+    ]);
+    expectNoSecret([thrown, ...events].map(errorText).join("\n"));
   });
 });
 

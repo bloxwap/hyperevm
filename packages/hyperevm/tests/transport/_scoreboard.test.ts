@@ -121,6 +121,20 @@ describe("Scoreboard heads", () => {
   });
 });
 
+describe("Scoreboard in-flight calls", () => {
+  test("expired calls are collected even when a lone endpoint is never scored", () => {
+    const clock = { now: 0 };
+    const target = board(["only"], clock);
+    for (let index = 0; index < 1_000; index += 1) target.begin("only", 100);
+    clock.now += 200;
+    for (let index = 0; index < 1_000; index += 1) {
+      expect(target.pick("eth_call", new Set(), "best", Math.random)?.id).toBe("only");
+      target.begin("only", 100)();
+    }
+    expect(target.held("only")).toBe(0);
+  });
+});
+
 describe("blockNumberFromResult", () => {
   test("reads eth_blockNumber and a latest eth_getBlockByNumber", () => {
     expect(blockNumberFromResult("eth_blockNumber", "0x10")).toBe(16);

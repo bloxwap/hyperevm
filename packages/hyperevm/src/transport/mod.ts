@@ -162,6 +162,7 @@ export interface HyperevmTransportOptions {
   /**
    * Check `eth_chainId` once per endpoint before its first call. An endpoint on another
    * chain is quarantined. Expected id: the client chain, or 999. Default: true.
+   * A viem transport whose `methods` filter rejects `eth_chainId` is not checked.
    */
   verifyChainId?: boolean | undefined;
   /** Passed to viem `http()` for URL endpoints. Default: off, same as viem's `http()`. */
@@ -433,8 +434,12 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     }
     const verifyChainId = options.verifyChainId ?? true;
     const expectedChainId = parameters.chain?.id ?? DEFAULT_CHAIN_ID;
+    // A child whose `methods` filter rejects `eth_chainId` cannot be checked. Its filter is the caller's choice.
     const gates = new Map<string, ChainGate>(
-      built.map((endpoint) => [endpoint.id, { verified: !verifyChainId, mismatch: undefined, pending: undefined }]),
+      built.map((endpoint) => [
+        endpoint.id,
+        { verified: !verifyChainId || !endpoint.supports("eth_chainId"), mismatch: undefined, pending: undefined },
+      ]),
     );
     const quarantined = (id: string): boolean => gates.get(id)?.mismatch !== undefined;
     const board = new Scoreboard(
@@ -655,7 +660,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
           }
           const wrapped = state.timedOut && !state.ignore ? new TimeoutError(timeout) : toError(outcome.error);
           const callerAbort = parent?.aborted === true || isAbortError(wrapped);
-          if (!state.ignore && !callerAbort) {
+          // A method the child's filter rejects never left the process, so it says nothing about the endpoint.
+          if (!state.ignore && !callerAbort && target.supports(method)) {
             // A terminal error is the endpoint answering about the call. It is not sick.
             const terminal = !shouldFailover(wrapped);
             if (terminal) {
@@ -790,8 +796,9 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     const probe = (): Promise<void> => {
       if (closed) return Promise.resolve();
       // An ejected endpoint is left alone until its cooldown ends. The provider may have asked for the quiet.
+      // A child whose `methods` filter rejects `eth_blockNumber` is never probed: viem would refuse it locally.
       const pending = built.map((endpoint) =>
-        breaker.isOpen(endpoint.id)
+        breaker.isOpen(endpoint.id) || !endpoint.supports("eth_blockNumber")
           ? Promise.resolve()
           : checkChain(endpoint).then((reason) =>
               reason
@@ -1189,6 +1196,24 @@ function scrubError(error: unknown, scrub: (text: string) => string): void {
         pending.push(item);
       }
     }
+    if (!Array.isArray(value)) scrubKeys(value, scrub);
+  }
+}
+
+/**
+ * Rename properties whose names hold a secret, in place. A gateway may key error data by URL.
+ * A plain object has every property re-added, so its key order survives.
+ */
+function scrubKeys(value: object, scrub: (text: string) => string): void {
+  const names = Object.getOwnPropertyNames(value);
+  if (names.every((name) => scrub(name) === name)) return;
+  const keepOrder = !(value instanceof Error);
+  for (const name of names) {
+    const scrubbed = scrub(name);
+    if (scrubbed === name && !keepOrder) continue;
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (!descriptor || !Reflect.deleteProperty(value, name)) continue;
+    Object.defineProperty(value, scrubbed, descriptor);
   }
 }
 

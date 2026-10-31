@@ -522,6 +522,75 @@ describe("in-flight accounting", () => {
   });
 });
 
+describe("method filters", () => {
+  /** A healthy endpoint whose viem `methods` filter allows only `include`. */
+  function filtered(include: readonly string[]): MockEndpoint {
+    const calls: { method: string }[] = [];
+    const transport: Transport = () =>
+      createTransport({
+        key: "filtered",
+        name: "filtered",
+        type: "test",
+        retryCount: 0,
+        methods: { include: [...include] },
+        request: (async ({ method }: EIP1193Parameters) => {
+          calls.push({ method });
+          return method === "eth_chainId" ? "0x3e7" : "0x1";
+        }) as EIP1193RequestFn,
+      });
+    return { transport, calls };
+  }
+
+  /** Answers the chain check and head probes, and fails every read. */
+  function brokenReads(): MockEndpoint {
+    return mockEndpoint("broken", (method) => {
+      if (method === "eth_chainId") return "0x3e7";
+      if (method === "eth_blockNumber") return "0x10";
+      throw new Error("socket hang up");
+    });
+  }
+
+  test("head probes skip an endpoint whose filter rejects eth_blockNumber", async () => {
+    const events: HyperevmEvent[] = [];
+    const node = filtered(["eth_chainId", "eth_call"]);
+    const backup = brokenReads();
+    const client = open({
+      endpoints: [node.transport, backup.transport],
+      verifyChainId: true,
+      onEvent: (event) => events.push(event),
+    });
+    expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    for (let index = 0; index < 3; index += 1) await client.value?.probe();
+    expect(events.some((event) => event.type === "eject")).toBe(false);
+    for (let index = 0; index < 3; index += 1)
+      expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+    expect(node.calls.map((call) => call.method)).toEqual([
+      "eth_chainId",
+      "eth_call",
+      "eth_call",
+      "eth_call",
+      "eth_call",
+    ]);
+  });
+
+  test("an endpoint whose filter rejects eth_chainId is not failed by the chain check", async () => {
+    const events: HyperevmEvent[] = [];
+    const node = filtered(["eth_call"]);
+    const backup = brokenReads();
+    const client = open({
+      endpoints: [node.transport, backup.transport],
+      verifyChainId: true,
+      onEvent: (event) => events.push(event),
+    });
+    for (let index = 0; index < 4; index += 1) {
+      expect(await client.request({ method: "eth_call", params: [] })).toBe("0x1");
+      await client.value?.probe();
+    }
+    expect(events.filter((event) => event.type === "error" && event.endpoint === "transport:0")).toEqual([]);
+    expect(node.calls.map((call) => call.method)).toEqual(["eth_call", "eth_call", "eth_call", "eth_call"]);
+  });
+});
+
 describe("filter polling", () => {
   test("eth_getFilterChanges is never re-sent after a lost response", async () => {
     const node = mockEndpoint("node", (_method, seen) => {

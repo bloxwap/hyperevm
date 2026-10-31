@@ -99,14 +99,21 @@ export class Scoreboard {
   /**
    * Count a call in flight for at most `ttlMs`. Returns the function that ends it. Calling that again does nothing.
    * The cap matters when the runtime drops the call's own cleanup, as Workers does with a cancelled invocation.
+   * Expired calls are collected here too, since a lone candidate is picked without being scored.
    */
   begin(id: string, ttlMs: number): () => void {
     const endpoint = this.#require(id);
+    this.#inflight(endpoint);
     const call = { until: this.#options.now() + ttlMs };
     endpoint.inflight.add(call);
     return (): void => {
       endpoint.inflight.delete(call);
     };
+  }
+
+  /** Calls kept for `id`, expired ones included. Tests use this to check that expired calls are collected. */
+  held(id: string): number {
+    return this.#require(id).inflight.size;
   }
 
   success(id: string, method: string, latencyMs: number, sampleLatency: boolean): void {
