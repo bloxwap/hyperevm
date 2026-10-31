@@ -3,14 +3,19 @@
  *
  * viem's `fallback` walks the list after a failure, and its `rank` option
  * pings on a timer. This transport orders endpoints from the calls it has
- * already made, then fails over. Non-idempotent methods are never retried
- * and never hedged.
+ * already made, then fails over. Once every endpoint has failed a call, it
+ * backs off and tries them again while `retryCount` allows. Endpoints that
+ * keep failing are ejected for a cooldown. Non-idempotent methods are never
+ * retried and never hedged. Signed raw transactions are the exception: the
+ * same bytes fail over on endpoint errors, since a rebroadcast cannot run twice.
  * @module
  */
 
 import {
   createTransport,
   http,
+  isHex,
+  keccak256,
   webSocket,
   type Chain,
   type EIP1193Parameters,
@@ -22,8 +27,23 @@ import {
 import { AllEndpointsFailedError, ChainMismatchError, TimeoutError, TransportClosedError } from "../_errors.ts";
 import { defaultRegistry, registryHttpEndpoints } from "../registry/_registry.ts";
 import { type EndpointUrl, normalizeEndpointUrl } from "../registry/_url.ts";
+import {
+  Breaker,
+  type BreakerConfig,
+  DEFAULT_BREAKER_COOLDOWN_MS,
+  DEFAULT_BREAKER_MAX_COOLDOWN_MS,
+  DEFAULT_BREAKER_THRESHOLD,
+  retryAfterMs,
+} from "./_breaker.ts";
 import type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
-import { isAbortError, isIdempotentMethod, shouldFailover, toError } from "./_methods.ts";
+import {
+  isAbortError,
+  isAlreadyKnownError,
+  isIdempotentMethod,
+  isRebroadcastMethod,
+  shouldFailover,
+  toError,
+} from "./_methods.ts";
 import { type ScoreConfig, defaultScoreConfig } from "./_score.ts";
 import {
   DEFAULT_MAX_AHEAD,
@@ -34,7 +54,13 @@ import {
 } from "./_scoreboard.ts";
 
 export type { EndpointSnapshot, HyperevmEvent } from "./_events.ts";
-export { NON_IDEMPOTENT_METHODS, isIdempotentMethod, shouldFailover } from "./_methods.ts";
+export {
+  NON_IDEMPOTENT_METHODS,
+  REBROADCAST_METHODS,
+  isIdempotentMethod,
+  isRebroadcastMethod,
+  shouldFailover,
+} from "./_methods.ts";
 export { blockNumberFromResult, parseQuantity } from "./_scoreboard.ts";
 export { defaultScoreConfig, endpointScore, inflation, type MethodStat, type ScoreConfig } from "./_score.ts";
 
@@ -53,11 +79,17 @@ const DEFAULT_PROBE_IDLE_MS = 60_000;
 /** viem's HTTP default. Our own deadline races the child transport. */
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-/** Extra attempts after the first, on idempotent methods only. */
+/** Extra attempts after the first, on idempotent methods and raw transaction rebroadcasts. */
 const DEFAULT_RETRY_COUNT = 2;
 
 /** Chain id endpoints must report when the client has no chain. */
 const DEFAULT_CHAIN_ID = 999;
+
+/** First backoff before re-trying endpoints that already failed this call, when `retryDelay` is 0. */
+const DEFAULT_RETRY_BACKOFF_MS = 100;
+
+/** Longest wait before a re-try. A call stops instead of waiting out a longer ejection. */
+const MAX_RETRY_BACKOFF_MS = 2_000;
 
 export interface HeadLagOptions {
   /** Blocks of lag that do not change the score. Default: 2. */
@@ -83,6 +115,15 @@ export interface HedgeOptions {
   minDelay?: number | undefined;
   /** After three samples, hedge once the call exceeds this multiple of the tail. Default: 2. */
   multiplier?: number | undefined;
+}
+
+export interface BreakerOptions {
+  /** Consecutive endpoint failures that eject an endpoint. Default: 3. */
+  threshold?: number | undefined;
+  /** First ejection in milliseconds. Each later ejection doubles it. Default: 5000. */
+  cooldown?: number | undefined;
+  /** Longest ejection in milliseconds, including a `Retry-After`. Default: 60000. */
+  maxCooldown?: number | undefined;
 }
 
 export interface BatchOptions {
@@ -129,11 +170,15 @@ export interface HyperevmTransportOptions {
   /** Transport name. Default: `"HyperEVM"`. */
   name?: string | undefined;
   /**
-   * Extra failovers after the first attempt, for idempotent methods.
-   * The same endpoint is not tried twice in one call. Default: 2.
+   * Extra attempts after the first, for idempotent methods and raw transaction rebroadcasts.
+   * Each endpoint is tried once before any is tried again. Default: 2.
    */
   retryCount?: number | undefined;
-  /** Wait between failovers, in milliseconds. Default: 0. */
+  /**
+   * Wait between failovers, in milliseconds. Default: 0.
+   * Re-trying endpoints that already failed this call waits a jittered exponential backoff
+   * from this base (100 when 0), capped at 2000, and at least any ejection left.
+   */
   retryDelay?: number | undefined;
   /** Per-attempt deadline in milliseconds. Wins over the client timeout. Default: the client timeout, or 10000. */
   timeout?: number | undefined;
@@ -147,6 +192,17 @@ export interface HyperevmTransportOptions {
   routing?: "best" | "p2c" | undefined;
   /** Extra methods that must not be retried or hedged. */
   nonIdempotentMethods?: readonly string[] | undefined;
+  /**
+   * Fail over `eth_sendRawTransaction` and `eth_sendRawTransactionSync` on endpoint errors.
+   * The same signed bytes have the same hash, and the nonce stops a second execution.
+   * They are never hedged. On a re-send, an "already known" answer returns the hash. Default: true.
+   */
+  rebroadcastRawTransactions?: boolean | undefined;
+  /**
+   * Eject an endpoint after consecutive failures, or for a `Retry-After`. Routing skips ejected
+   * endpoints unless all are ejected, and a failed call does not fail over into one. Default: enabled.
+   */
+  breaker?: boolean | BreakerOptions | undefined;
   /**
    * Return true to stop failover, matching viem `fallback`'s `shouldThrow`.
    * Terminal errors (reverts, invalid params, aborts) already stop failover.
@@ -248,6 +304,16 @@ function resolveHeadLag(value: boolean | HeadLagOptions | undefined): ResolvedHe
   };
 }
 
+function resolveBreaker(value: boolean | BreakerOptions | undefined): BreakerConfig {
+  const options = typeof value === "object" ? value : {};
+  return {
+    enabled: value !== false,
+    threshold: options.threshold ?? DEFAULT_BREAKER_THRESHOLD,
+    cooldownMs: options.cooldown ?? DEFAULT_BREAKER_COOLDOWN_MS,
+    maxCooldownMs: options.maxCooldown ?? DEFAULT_BREAKER_MAX_COOLDOWN_MS,
+  };
+}
+
 function resolveHedge(value: boolean | HedgeOptions | undefined): ResolvedHedge {
   if (!value) return { enabled: false, minDelay: 250, multiplier: 2 };
   const options = value === true ? {} : value;
@@ -338,6 +404,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
   // viem instantiates the transport once per client. Sharing keeps per-request clients
   // from multiplying probe timers or resetting learned scores.
   const shared = new Map<string, ReturnType<Transport<"hyperevm", HyperevmTransportValue>>>();
+  const rebroadcastRaw = options.rebroadcastRawTransactions ?? true;
+  const breakerConfig = resolveBreaker(options.breaker);
 
   return (parameters: {
     account?: unknown;
@@ -352,6 +420,8 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     const key = sharedKey(timeout, retryCount, parameters.chain);
     const existing = shared.get(key);
     if (existing) return existing;
+    const retryBackoff = retryDelay > 0 ? retryDelay : DEFAULT_RETRY_BACKOFF_MS;
+    const breaker = new Breaker(breakerConfig, now);
     const built = buildEndpoints(options, parameters.chain, timeout);
     if (built.length === 0) {
       throw new Error("hyperevm() requires at least one endpoint. The registry has none eligible.");
@@ -378,6 +448,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         maxAhead: headLag.maxAhead,
         config: { ...defaultScoreConfig, ...options.score },
         now,
+        ejected: (id: string): boolean => breaker.isOpen(id),
       },
     );
     const listeners = new Set<(event: HyperevmEvent) => void>();
@@ -399,6 +470,23 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
 
     const byId = new Map(built.map((endpoint) => [endpoint.id, endpoint]));
 
+    /** A healthy answer, including a terminal error, closes the circuit. */
+    const closeCircuit = (endpoint: RankedEndpoint): void => {
+      if (breaker.success(endpoint.id)) emit({ type: "restore", endpoint: endpoint.url });
+    };
+
+    const openCircuit = (endpoint: RankedEndpoint, error: Error): void => {
+      const ejection = breaker.failure(endpoint.id, retryAfterMs(error, Date.now()));
+      if (!ejection) return;
+      emit({
+        type: "eject",
+        endpoint: endpoint.url,
+        failures: ejection.failures,
+        cooldownMs: ejection.cooldownMs,
+        error,
+      });
+    };
+
     /**
      * Resolve to undefined once `endpoint` has reported the expected chain id, or to the reason it cannot serve yet.
      * The check bypasses `start()`, so it never writes a latency sample. A failed check counts as a failed probe
@@ -415,6 +503,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
           const chainId = parseQuantity(result);
           if (chainId === expectedChainId) {
             gate.verified = true;
+            closeCircuit(endpoint);
             return undefined;
           }
           if (chainId === null) return new Error(`${endpoint.url} returned no chain id.`);
@@ -425,8 +514,11 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         (error: unknown): Error => {
           const wrapped = toError(error);
           const latencyMs = Math.max(0, now() - started);
+          const terminal = !shouldFailover(wrapped);
           board.failure(endpoint.id, "eth_chainId", latencyMs, false, timeout);
-          emit({ type: "error", endpoint: endpoint.url, method: "eth_chainId", latencyMs, error: wrapped });
+          emit({ type: "error", endpoint: endpoint.url, method: "eth_chainId", latencyMs, error: wrapped, terminal });
+          // A 429 or outage on the check is the endpoint failing, so it counts toward ejection like any call.
+          if (!terminal) openCircuit(endpoint, wrapped);
           return wrapped;
         },
       );
@@ -440,6 +532,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
     /**
      * `board.pick`, skipping endpoints whose chain check fails.
      * A skipped endpoint is excluded for this call and its reason joins `errors`, so it never costs an attempt.
+     * After a failed check, an ejected endpoint is not checked next, so a storm costs one check per call.
      * A verified pick returns synchronously, so concurrent calls still see each other's in-flight counts.
      */
     const pickVerified = (
@@ -448,6 +541,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       mode: "best" | "p2c",
       parent: AbortSignal | undefined,
       errors: Error[],
+      skipEjected = false,
     ): RankedEndpoint | undefined | Promise<RankedEndpoint | undefined> => {
       const endpoint = board.pick(method, exclude, mode, random);
       if (!endpoint) {
@@ -456,13 +550,14 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         }
         return undefined;
       }
+      if (skipEjected && breaker.isOpen(endpoint.id)) return undefined;
       const target = byId.get(endpoint.id);
       if (!target || gates.get(endpoint.id)?.verified !== false) return endpoint;
       return untilAborted(checkChain(target), parent).then((reason) => {
         if (!reason) return endpoint;
         exclude.add(endpoint.id);
         errors.push(reason);
-        return pickVerified(method, exclude, mode, parent, errors);
+        return pickVerified(method, exclude, mode, parent, errors, true);
       });
     };
 
@@ -535,14 +630,23 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
                 });
               }
               emit({ type: "success", endpoint: endpoint.url, method, latencyMs, hedged });
+              closeCircuit(endpoint);
             }
             return outcome.result;
           }
           const wrapped = state.timedOut && !state.ignore ? new TimeoutError(timeout) : toError(outcome.error);
           const callerAbort = parent?.aborted === true || isAbortError(wrapped);
           if (!state.ignore && !callerAbort) {
-            board.failure(endpoint.id, method, latencyMs, sampleLatency, timeout);
-            emit({ type: "error", endpoint: endpoint.url, method, latencyMs, error: wrapped });
+            // A terminal error is the endpoint answering about the call. It is not sick.
+            const terminal = !shouldFailover(wrapped);
+            if (terminal) {
+              board.success(endpoint.id, method, latencyMs, sampleLatency);
+            } else {
+              board.failure(endpoint.id, method, latencyMs, sampleLatency, timeout);
+            }
+            emit({ type: "error", endpoint: endpoint.url, method, latencyMs, error: wrapped, terminal });
+            if (terminal) closeCircuit(endpoint);
+            else openCircuit(endpoint, wrapped);
           }
           throw wrapped;
         })
@@ -568,24 +672,49 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       params: unknown,
       parent: AbortSignal | undefined,
       idempotent: boolean,
+      rebroadcast = false,
     ): Promise<unknown> => {
       const exclude = new Set<string>();
       const errors: Error[] = [];
-      const attempts = idempotent ? retryCount + 1 : 1;
+      const retries = idempotent || rebroadcast;
+      const attempts = retries ? retryCount + 1 : 1;
       let previous: RankedEndpoint | undefined;
+      let round = 0;
       for (let attempt = 0; attempt < attempts; attempt += 1) {
+        // A verified pick is synchronous, so `start()` counts it in flight before any other call picks.
         const picked = pickVerified(method, exclude, attempt === 0 ? routing : "best", parent, errors);
-        const endpoint = picked instanceof Promise ? await picked : picked;
+        let endpoint = picked instanceof Promise ? await picked : picked;
+        let wait = attempt > 0 ? retryDelay : 0;
+        if (!endpoint && exclude.size > 0) {
+          // Every eligible endpoint failed this call, or failed its chain check. Start another round after a backoff.
+          exclude.clear();
+          const candidate = board.pick(method, exclude, "best", random);
+          if (!candidate) break;
+          const ejectedMs = breaker.remaining(candidate.id);
+          if (ejectedMs > MAX_RETRY_BACKOFF_MS) break;
+          await delay(Math.max(backoffMs(round, retryBackoff, random), ejectedMs), parent);
+          round += 1;
+          wait = 0;
+          endpoint = await pickVerified(method, exclude, "best", parent, errors);
+        } else if (endpoint && attempt > 0 && breaker.isOpen(endpoint.id)) {
+          // Only ejected endpoints are left. Failing over into them amplifies an outage.
+          break;
+        }
         if (!endpoint) break;
         exclude.add(endpoint.id);
         if (previous) emit({ type: "failover", from: previous.url, to: endpoint.url, method });
-        if (attempt > 0 && retryDelay > 0) await delay(retryDelay, parent);
+        if (wait > 0) await delay(wait, parent);
         try {
           return await dispatch(endpoint, method, params, parent, idempotent, exclude);
         } catch (error: unknown) {
           const wrapped = toError(error);
           errors.push(wrapped);
-          const stop = !idempotent || !shouldFailover(wrapped) || options.shouldThrow?.(wrapped) === true;
+          if (rebroadcast && attempt > 0 && isAlreadyKnownError(wrapped)) {
+            // An earlier attempt delivered these bytes. Report the hash it would have returned.
+            const hash = rebroadcastHash(method, params);
+            if (hash) return hash;
+          }
+          const stop = !retries || !shouldFailover(wrapped) || options.shouldThrow?.(wrapped) === true;
           if (stop) throw wrapped;
           previous = endpoint;
         }
@@ -610,7 +739,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       const wait = board.hedgeDelay(endpoint.id, method, hedge.minDelay, hedge.multiplier);
       return raceHedge(primary, wait, () => {
         const next = board.pick(method, verifiedOnly(exclude), "best", random);
-        if (!next) return undefined;
+        if (!next || breaker.isOpen(next.id)) return undefined;
         emit({ type: "hedge", endpoint: next.url, method });
         exclude.add(next.id);
         return start(next, method, params, parent, true, true);
@@ -692,7 +821,9 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
           touch();
           const method = args.method;
           const idempotent = isIdempotentMethod(method, extraNonIdempotent);
-          return send(method, "params" in args ? args.params : undefined, requestOptions?.signal, idempotent);
+          const rebroadcast = rebroadcastRaw && isRebroadcastMethod(method);
+          const params = "params" in args ? args.params : undefined;
+          return send(method, params, requestOptions?.signal, idempotent, rebroadcast);
         }) as EIP1193RequestFn,
       },
       value,
@@ -747,6 +878,20 @@ function raceHedge(primary: Inflight, waitMs: number, startHedge: () => Inflight
       },
     );
   });
+}
+
+/** Jittered exponential backoff: half to all of `base * 2^round`, capped. */
+function backoffMs(round: number, base: number, random: () => number): number {
+  const ceiling = Math.min(MAX_RETRY_BACKOFF_MS, base * 2 ** round);
+  return Math.round(ceiling * (0.5 + random() * 0.5));
+}
+
+/** `keccak256` of the signed bytes, which is the hash `eth_sendRawTransaction` returns. */
+function rebroadcastHash(method: string, params: unknown): string | undefined {
+  if (method !== "eth_sendRawTransaction" || !Array.isArray(params)) return undefined;
+  const raw: unknown = params[0];
+  if (typeof raw !== "string" || !isHex(raw, { strict: true })) return undefined;
+  return keccak256(raw);
 }
 
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {

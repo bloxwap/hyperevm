@@ -53,6 +53,8 @@ export interface ScoreboardOptions {
   maxAhead?: number | undefined;
   config?: ScoreConfig | undefined;
   now: () => number;
+  /** Ejected endpoints. `pick` skips them unless every candidate is ejected. */
+  ejected?: ((id: string) => boolean) | undefined;
 }
 
 /** Picks an endpoint and records what happened after the call. */
@@ -72,14 +74,17 @@ export class Scoreboard {
     this.#options = options;
   }
 
-  /** Lowest score, or the better of two randomly drawn endpoints. */
+  /** Lowest score, or the better of two randomly drawn endpoints. Ejected endpoints are a last resort. */
   pick(
     method: string,
     exclude: ReadonlySet<string>,
     mode: "best" | "p2c",
     random: () => number,
   ): RankedEndpoint | undefined {
-    const candidates = this.#endpoints.filter((endpoint) => !exclude.has(endpoint.id) && endpoint.supports(method));
+    const eligible = this.#endpoints.filter((endpoint) => !exclude.has(endpoint.id) && endpoint.supports(method));
+    const ejected = this.#options.ejected;
+    const closed = ejected ? eligible.filter((endpoint) => !ejected(endpoint.id)) : eligible;
+    const candidates = closed.length > 0 ? closed : eligible;
     const chosen =
       candidates.length === 0
         ? undefined

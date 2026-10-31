@@ -24,6 +24,11 @@ export type HyperevmEvent =
       method: string;
       latencyMs: number;
       error: Error;
+      /**
+       * True when the error describes the call (revert, invalid params, rejected
+       * transaction). The endpoint answered, so its score and circuit treat it as healthy.
+       */
+      terminal?: boolean | undefined;
     }
   | {
       type: "failover";
@@ -51,6 +56,19 @@ export type HyperevmEvent =
       endpoint: string;
       chainId: number;
       expected: number;
+    }
+  | {
+      /** Consecutive failures or a `Retry-After` took the endpoint out of rotation. */
+      type: "eject";
+      endpoint: string;
+      failures: number;
+      cooldownMs: number;
+      error: Error;
+    }
+  | {
+      /** A healthy answer closed an ejected endpoint's circuit. */
+      type: "restore";
+      endpoint: string;
     };
 
 /** One endpoint as the transport currently scores it. */

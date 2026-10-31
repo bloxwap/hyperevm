@@ -263,7 +263,9 @@ describe("endpoint list validation", () => {
 describe("option resolution", () => {
   test("options.timeout wins over the client timeout", async () => {
     const hung = mockEndpoint("hung", (method) => (method === "eth_chainId" ? "0x3e7" : new Promise(() => {})));
-    const client = hyperevm({ endpoints: [hung.transport], timeout: 30, headLag: false })({ timeout: 60_000 });
+    const client = hyperevm({ endpoints: [hung.transport], timeout: 30, retryCount: 0, headLag: false })({
+      timeout: 60_000,
+    });
     expect(client.config.timeout).toBe(30);
     const started = Date.now();
     await expect(client.request({ method: "eth_call", params: [] })).rejects.toBeInstanceOf(TimeoutError);
@@ -342,7 +344,8 @@ describe("chain id verification", () => {
   });
 
   test("a failed check does not quarantine and is retried", async () => {
-    let failChecks = 1;
+    // The call re-tries the check once after a backoff, so two failures fail the first call.
+    let failChecks = 2;
     const node = mockEndpoint("node", (method) => {
       if (method === "eth_chainId" && failChecks > 0) {
         failChecks -= 1;
@@ -353,6 +356,20 @@ describe("chain id verification", () => {
     const client = open({ endpoints: [node.transport] });
     await expect(client.request({ method: "eth_blockNumber" })).rejects.toThrow(/socket hang up/);
     expect(client.value?.snapshot()[0]?.quarantined).toBe(false);
+    expect(await client.request({ method: "eth_blockNumber" })).toBe("0x1");
+    expect(node.calls).toEqual(["eth_chainId", "eth_chainId", "eth_chainId", "eth_blockNumber"]);
+  });
+
+  test("a single endpoint survives one failed check within the call", async () => {
+    let failChecks = 1;
+    const node = mockEndpoint("node", (method) => {
+      if (method === "eth_chainId" && failChecks > 0) {
+        failChecks -= 1;
+        throw new Error("socket hang up");
+      }
+      return method === "eth_chainId" ? "0x3e7" : "0x1";
+    });
+    const client = open({ endpoints: [node.transport] });
     expect(await client.request({ method: "eth_blockNumber" })).toBe("0x1");
     expect(node.calls).toEqual(["eth_chainId", "eth_chainId", "eth_blockNumber"]);
   });

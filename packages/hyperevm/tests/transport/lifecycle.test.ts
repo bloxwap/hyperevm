@@ -171,6 +171,8 @@ describe("hyperevm transport lifecycle", () => {
       routing: "best",
       retryCount: 1,
       retryDelay: 1,
+      // Every call fails, so the breaker would eject both endpoints and skip the waits this test counts.
+      breaker: false,
     })({ timeout: 1_000 });
     for (let index = 0; index < 10; index += 1) {
       await expect(
