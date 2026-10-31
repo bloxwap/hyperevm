@@ -91,23 +91,25 @@ export class Scoreboard {
 
   success(id: string, method: string, latencyMs: number, sampleLatency: boolean): void {
     const endpoint = this.#require(id);
+    const config = this.#config();
     if (!sampleLatency) {
-      observeLiveness(endpoint.global, true, 0);
+      observeLiveness(endpoint.global, true, 0, config);
       return;
     }
-    observe(endpoint.global, latencyMs, true);
-    observe(this.#method(endpoint, method), latencyMs, true);
+    observe(endpoint.global, latencyMs, true, config);
+    observe(this.#method(endpoint, method), latencyMs, true, config);
   }
 
   failure(id: string, method: string, latencyMs: number, sampleLatency: boolean, penaltyMs: number): void {
     const endpoint = this.#require(id);
+    const config = this.#config();
     if (!sampleLatency) {
-      observeLiveness(endpoint.global, false, penaltyMs);
-      observeLiveness(this.#method(endpoint, method), false, penaltyMs);
+      observeLiveness(endpoint.global, false, penaltyMs, config);
+      observeLiveness(this.#method(endpoint, method), false, penaltyMs, config);
       return;
     }
-    observe(endpoint.global, latencyMs, false);
-    observe(this.#method(endpoint, method), latencyMs, false);
+    observe(endpoint.global, latencyMs, false, config);
+    observe(this.#method(endpoint, method), latencyMs, false, config);
   }
 
   /** Record a block number. Returns lag behind the best fresh head. */
@@ -182,11 +184,15 @@ export class Scoreboard {
     return Math.max(0, best - endpoint.head);
   }
 
+  #config(): ScoreConfig {
+    return this.#options.config ?? defaultScoreConfig;
+  }
+
   #lagPenalty(endpoint: EndpointState): number {
     if (!this.#options.headLag) return 1;
     const lag = this.#lag(endpoint);
     if (lag === null || lag <= this.#options.maxLag) return 1;
-    return 1 + (lag - this.#options.maxLag);
+    return 1 + this.#config().lagWeight * (lag - this.#options.maxLag);
   }
 
   #bestHead(now: number): number | null {

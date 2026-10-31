@@ -1,0 +1,37 @@
+name: Benchmark
+
+# Manual live pass over the public registry. It does not run on pull
+# requests. The offline simulation is part of CI via bun test.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Live benchmark
+        run: bun run bench:live
+        env:
+          BENCH_OUT: bench-live.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hyperevm-live-benchmark
+          path: bench-live.json
+          if-no-files-found: error

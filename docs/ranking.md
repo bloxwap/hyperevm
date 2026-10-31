@@ -14,7 +14,7 @@ Service time is
 service = mix * ewma + (1 - mix) * tail
 ```
 
-with `mix` defaulting to 0.6. The tail EWMA uses a larger step when the new sample is slower than the tail, and a small step when it is faster. A single slow response moves the tail immediately. A run of fast responses does not wipe it out. That is the C3 idea used here: rank on the slow tail, not only the mean. The cubic queue function from the C3 paper is not used raw. A burst of parallel `eth_call`s would otherwise exile a healthy public node. The in-flight term is Prequal's "your call waits behind the ones already running", plus a damped square:
+with `mix` defaulting to 0.6 (`latencyMix`). The tail EWMA uses a larger step when the new sample is slower than the tail (`tailAlphaUp` 0.5), and a small step when it is faster (`tailAlphaDown` 0.05). The mean uses `ewmaAlphaUp` 0.4 and `ewmaAlphaDown` 0.2. Failures move an error EWMA with `errorAlpha` 0.3. A single slow response moves the tail immediately. A run of fast responses does not wipe it out. That is the C3 idea used here: rank on the slow tail, not only the mean. The cubic queue function from the C3 paper is not used raw. A burst of parallel `eth_call`s would otherwise exile a healthy public node. The in-flight term is Prequal's "your call waits behind the ones already running", plus a damped square:
 
 ```
 inflation = 1 + inflight + 0.25 * inflight^2
@@ -23,7 +23,7 @@ score     = service * inflation * (1 + 8 * error) * lagPenalty / weight
 
 Lower score is better. `weight` comes from the registry. An explicit endpoint you pass yourself defaults to weight 1 when the registry has no positive weight for it.
 
-`lagPenalty` is 1 when head-lag checks are off, when this endpoint's head is unknown, or when it is within `maxLag` blocks (default 2) of the best head seen recently. Past that, the penalty is `1 + (lag - maxLag)`.
+`lagPenalty` is 1 when head-lag checks are off, when this endpoint's head is unknown, or when it is within `maxLag` blocks (default 2) of the best head seen recently. Past that, the penalty is `1 + lagWeight * (lag - maxLag)`, and `lagWeight` defaults to 1.
 
 The first attempt uses power of two choices: draw two endpoints that support the method, send to the one with the better score. Failover, and hedging, then take the best remaining endpoint. Ties break toward the earlier endpoint.
 
@@ -83,6 +83,6 @@ URLs with a query string, a username, or a hash are rejected. `http://` is rejec
 ## Gaps
 
 - There is no merged `value.subscribe`. A subscription stays on the socket that accepted `eth_subscribe`. viem's `fallback` has the same gap. HTTP endpoints do not serve subscriptions.
-- Hedge defaults off. Turning it on doubles some reads against free public nodes.
+- Hedge defaults off. A stall study is in [benchmarks.md](benchmarks.md). The cold hedge fires at `minDelay` (250ms), and several public nodes are slower than that, so those first calls would be duplicated.
 - The shipped history starts with one probe run. Full weight waits for the window above, so every endpoint in the first ranked file is on the new-node cap.
-- This document does not claim a benchmark against `fallback`. Measuring that under load is still open.
+- The simulated comparison with viem `fallback` is in [benchmarks.md](benchmarks.md). A live run is a manual workflow, not part of CI.

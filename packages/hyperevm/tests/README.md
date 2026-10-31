@@ -8,6 +8,7 @@ Test suite for the transport, run with `bun test`.
 | --- | --- |
 | `tests/transport/` | The viem transport: routing, failover, hedging, head lag, batches, scores, and method policy. |
 | `tests/registry/` | The shipped registry, URL checks, rank policy, probe lag assignment, and source parsers. |
+| `tests/bench/` | The offline simulation against viem `fallback`. |
 
 ## Running
 
