@@ -16,7 +16,9 @@
     "typecheck": "bun run check:sdk",
     "test": "cd packages/hyperevm && bun run test",
     "build": "cd packages/hyperevm && bun run build",
-    "rank": "cd packages/hyperevm && bun run rank"
+    "rank": "cd packages/hyperevm && bun run rank",
+    "bench": "cd packages/hyperevm && bun run bench",
+    "bench:live": "cd packages/hyperevm && bun run bench:live"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15"

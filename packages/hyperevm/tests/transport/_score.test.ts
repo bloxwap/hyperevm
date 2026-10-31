@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { emptyStat, endpointScore, inflation, observe, serviceMs } from "../../src/transport/_score.ts";
+import { Scoreboard } from "../../src/transport/_scoreboard.ts";
+import {
+  defaultScoreConfig,
+  emptyStat,
+  endpointScore,
+  inflation,
+  observe,
+  serviceMs,
+} from "../../src/transport/_score.ts";
 
 describe("endpointScore", () => {
   test("inflation grows with in-flight calls and includes a squared queue term", () => {
@@ -49,6 +57,50 @@ describe("endpointScore", () => {
     const onlyGlobal = endpointScore({ ...shared, method: undefined, perMethod: false });
     expect(blended).toBeLessThan(onlyGlobal);
     expect(serviceMs(method)).toBeLessThan(serviceMs(global));
+  });
+
+  test("the default alphas match a call that omits the config", () => {
+    const implied = emptyStat();
+    const explicit = emptyStat();
+    observe(implied, 30, true);
+    observe(explicit, 30, true, defaultScoreConfig);
+    observe(implied, 90, true);
+    observe(explicit, 90, true, defaultScoreConfig);
+    expect(explicit).toEqual(implied);
+  });
+
+  test("a larger upward alpha moves the mean further", () => {
+    const gentle = emptyStat();
+    const sharp = emptyStat();
+    observe(gentle, 40, true);
+    observe(sharp, 40, true);
+    observe(gentle, 200, true, { ...defaultScoreConfig, ewmaAlphaUp: 0.1 });
+    observe(sharp, 200, true, { ...defaultScoreConfig, ewmaAlphaUp: 0.9 });
+    expect(sharp.ewma).toBeGreaterThan(gentle.ewma);
+  });
+
+  test("lagWeight scales the penalty past maxLag", () => {
+    const make = (lagWeight: number): number => {
+      const board = new Scoreboard(
+        [
+          { id: "ahead", url: "ahead", weight: 1, index: 0, supports: () => true },
+          { id: "behind", url: "behind", weight: 1, index: 1, supports: () => true },
+        ],
+        {
+          perMethod: false,
+          headLag: true,
+          maxLag: 2,
+          staleMs: 30_000,
+          now: () => 1_000,
+          config: { ...defaultScoreConfig, lagWeight },
+        },
+      );
+      board.noteHead("ahead", 100);
+      board.noteHead("behind", 90);
+      const behind = board.snapshot("eth_call").find((row) => row.id === "behind");
+      return behind?.score ?? 0;
+    };
+    expect(make(2)).toBeGreaterThan(make(1));
   });
 
   test("the tail remembers a slow sample longer than the mean", () => {

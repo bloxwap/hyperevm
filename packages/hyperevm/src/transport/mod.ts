@@ -127,6 +127,11 @@ export interface HyperevmTransportValue {
   snapshot: () => readonly EndpointSnapshot[];
   /** Endpoints this transport was built with. */
   endpoints: readonly { id: string; url: string; weight: number }[];
+  /**
+   * Probe every endpoint's head once.
+   * The background timer calls this on `probeInterval`. A failed probe updates liveness and does not write the latency EWMA.
+   */
+  probe: () => Promise<void>;
 }
 
 interface ResolvedHeadLag {
@@ -433,13 +438,19 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       });
     };
 
+    const probe = (): Promise<void> => {
+      const pending = built.map((endpoint) =>
+        start(endpoint, "eth_blockNumber", [], undefined, false, false).promise.then(
+          () => undefined,
+          () => undefined,
+        ),
+      );
+      return Promise.all(pending).then(() => undefined);
+    };
+
     if (headLag.enabled && headLag.probeInterval !== false && headLag.probeInterval > 0) {
       const timer = setInterval(() => {
-        for (const endpoint of built) {
-          void start(endpoint, "eth_blockNumber", [], undefined, false, false).promise.catch((error: unknown) => {
-            void error;
-          });
-        }
+        void probe();
       }, headLag.probeInterval);
       unrefTimer(timer);
     }
@@ -453,6 +464,7 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
       },
       snapshot: () => board.snapshot("eth_call"),
       endpoints: built.map((endpoint) => ({ id: endpoint.id, url: endpoint.url, weight: endpoint.weight })),
+      probe,
     };
 
     return createTransport(

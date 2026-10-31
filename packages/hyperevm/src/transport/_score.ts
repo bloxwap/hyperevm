@@ -25,8 +25,22 @@ export interface MethodStat {
 export interface ScoreConfig {
   /** Weight of the mean EWMA inside the service estimate. The rest is the tail. */
   latencyMix: number;
+  /** EWMA step when a successful sample is slower than the current mean. */
+  ewmaAlphaUp: number;
+  /** EWMA step when a successful sample is faster than the current mean. */
+  ewmaAlphaDown: number;
+  /** Tail step when a sample is slower than the current tail. */
+  tailAlphaUp: number;
+  /** Tail step when a sample is faster than the current tail. */
+  tailAlphaDown: number;
+  /** Step for the error EWMA on a finished call. */
+  errorAlpha: number;
+  /** Step for cooling the error EWMA after a head probe succeeds. */
+  livenessAlpha: number;
   /** Multiplier on the error EWMA inside the penalty. */
   errorWeight: number;
+  /** Multiplier on blocks of lag past `maxLag`. 1 keeps `1 + (lag - maxLag)`. */
+  lagWeight: number;
   /** Service time assumed before any sample exists. */
   priorMs: number;
   /** Samples required before the prior is fully replaced. */
@@ -39,7 +53,14 @@ export interface ScoreConfig {
 
 export const defaultScoreConfig: ScoreConfig = {
   latencyMix: 0.6,
+  ewmaAlphaUp: 0.4,
+  ewmaAlphaDown: 0.2,
+  tailAlphaUp: 0.5,
+  tailAlphaDown: 0.05,
+  errorAlpha: 0.3,
+  livenessAlpha: 0.15,
   errorWeight: 8,
+  lagWeight: 1,
   priorMs: 250,
   confidenceSamples: 5,
   methodBlendSamples: 3,
@@ -59,7 +80,12 @@ function mix(previous: number, sample: number, alpha: number): number {
  * Fold one finished call into `stat`.
  * Failures move the tail and the error rate, and they do not pretend to be a fast success.
  */
-export function observe(stat: MethodStat, latencyMs: number, ok: boolean): void {
+export function observe(
+  stat: MethodStat,
+  latencyMs: number,
+  ok: boolean,
+  config: ScoreConfig = defaultScoreConfig,
+): void {
   const latency = latencyMs < 0 ? 0 : latencyMs;
   if (stat.n === 0) {
     stat.ewma = ok ? latency : 0;
@@ -69,12 +95,12 @@ export function observe(stat: MethodStat, latencyMs: number, ok: boolean): void 
     return;
   }
   if (ok) {
-    const alpha = latency > stat.ewma ? 0.4 : 0.2;
+    const alpha = latency > stat.ewma ? config.ewmaAlphaUp : config.ewmaAlphaDown;
     stat.ewma = mix(stat.ewma, latency, alpha);
   }
-  const tailAlpha = latency > stat.tail ? 0.5 : 0.05;
+  const tailAlpha = latency > stat.tail ? config.tailAlphaUp : config.tailAlphaDown;
   stat.tail = mix(stat.tail, latency, tailAlpha);
-  stat.error = mix(stat.error, ok ? 0 : 1, 0.3);
+  stat.error = mix(stat.error, ok ? 0 : 1, config.errorAlpha);
   stat.n += 1;
 }
 
@@ -82,10 +108,15 @@ export function observe(stat: MethodStat, latencyMs: number, ok: boolean): void 
  * Update liveness without teaching the latency EWMA.
  * Probe successes only cool the error rate. Probe failures push the tail toward `penaltyMs`.
  */
-export function observeLiveness(stat: MethodStat, ok: boolean, penaltyMs: number): void {
+export function observeLiveness(
+  stat: MethodStat,
+  ok: boolean,
+  penaltyMs: number,
+  config: ScoreConfig = defaultScoreConfig,
+): void {
   if (ok) {
     if (stat.n === 0) return;
-    stat.error = mix(stat.error, 0, 0.15);
+    stat.error = mix(stat.error, 0, config.livenessAlpha);
     return;
   }
   const penalty = penaltyMs < 0 ? 0 : penaltyMs;
@@ -95,9 +126,9 @@ export function observeLiveness(stat: MethodStat, ok: boolean, penaltyMs: number
     stat.n = 1;
     return;
   }
-  const tailAlpha = penalty > stat.tail ? 0.5 : 0.05;
+  const tailAlpha = penalty > stat.tail ? config.tailAlphaUp : config.tailAlphaDown;
   stat.tail = mix(stat.tail, penalty, tailAlpha);
-  stat.error = mix(stat.error, 1, 0.3);
+  stat.error = mix(stat.error, 1, config.errorAlpha);
 }
 
 /** Estimated service time in milliseconds, pulled toward `priorMs` while the sample count is low. */

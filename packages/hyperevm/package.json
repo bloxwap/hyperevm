@@ -46,7 +46,9 @@
     "typecheck": "tsc --project tsconfig.json",
     "test": "bun test tests/",
     "build": "bun run .dev/build/build.ts",
-    "rank": "bun run .dev/rank.ts"
+    "rank": "bun run .dev/rank.ts",
+    "bench": "bun run .dev/bench/simulate.ts",
+    "bench:live": "bun run .dev/bench/live.ts"
   },
   "peerDependencies": {
     "viem": "^2.0.0"
