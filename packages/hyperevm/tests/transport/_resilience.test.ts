@@ -486,6 +486,51 @@ describe("breaker interactions", () => {
   });
 });
 
+describe("delayed failover", () => {
+  test("a pick ejected by a concurrent call during retryDelay is dropped", async () => {
+    const events: HyperevmEvent[] = [];
+    const calls: string[] = [];
+    const node =
+      (name: string, handler: (method: string) => unknown, exclude: string[] = []): Transport =>
+      () =>
+        createTransport({
+          key: name,
+          name,
+          type: "test",
+          retryCount: 0,
+          methods: { exclude },
+          request: (async ({ method }: EIP1193Parameters) => {
+            calls.push(`${name}:${method}`);
+            return handler(method);
+          }) as EIP1193RequestFn,
+        });
+    let failA = true;
+    const a = node("a", () => {
+      if (!failA) return "0xa";
+      failA = false;
+      throw new Error("socket hang up");
+    }, ["eth_getBalance"]);
+    const b = node("b", (method) => {
+      if (method === "eth_getBalance") {
+        throw Object.assign(new Error("rate limited"), { headers: new Headers({ "retry-after": "30" }) });
+      }
+      return "0xb";
+    });
+    const client = open({ endpoints: [a, b], retryDelay: 100, onEvent: (event) => events.push(event) });
+    // P fails on A, picks B, and waits out retryDelay.
+    const p = client.request({ method: "eth_call", params: [] });
+    await sleep(20);
+    // Q reaches only B, which asks for 30 seconds of quiet.
+    await expect(client.request({ method: "eth_getBalance", params: ["0x0", "latest"] })).rejects.toThrow(
+      /rate limited/,
+    );
+    expect(events.some((event) => event.type === "eject" && event.endpoint === "transport:1")).toBe(true);
+    expect(await p).toBe("0xa");
+    expect(calls).toEqual(["a:eth_call", "b:eth_getBalance", "a:eth_call"]);
+    expect(events.some((event) => event.type === "restore")).toBe(false);
+  });
+});
+
 describe("in-flight accounting", () => {
   test("an attempt stuck in a cancelled invocation stops counting as in flight after its deadline", async () => {
     let nowMs = 0;

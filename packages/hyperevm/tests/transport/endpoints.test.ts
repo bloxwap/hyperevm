@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  BaseError,
   createPublicClient,
   createTransport,
   HttpRequestError,
@@ -82,7 +83,10 @@ function open(options: HyperevmTransportOptions, timeout = 1_000) {
   return hyperevm({ headLag: false, routing: "best", hedge: false, retryCount: 2, ...options })({ timeout });
 }
 
-/** Every string an error holds at any depth, property names included: its causes, nested objects and arrays, and headers. */
+/**
+ * Every string an error holds at any depth, property names included: inherited messages and stacks, causes,
+ * nested objects and arrays, and headers.
+ */
 function errorText(error: unknown): string {
   const parts: string[] = [];
   const seen = new Set<object>();
@@ -97,7 +101,11 @@ function errorText(error: unknown): string {
       for (const [name, item] of value) parts.push(name, item);
       return;
     }
-    const keys = value instanceof Error ? [...Object.getOwnPropertyNames(value), "cause"] : Object.keys(value);
+    // An Error's message and stack may be inherited, as on a DOMException.
+    const keys =
+      value instanceof Error
+        ? [...Object.getOwnPropertyNames(value), "cause", "message", "stack", "name"]
+        : Object.keys(value);
     for (const key of keys) {
       parts.push(key);
       visit(Reflect.get(value, key));
@@ -331,6 +339,81 @@ describe("explicit endpoints that carry keys", () => {
       ["https://hyperpc.example.test", "unavailable"],
       ["last", 2],
     ]);
+    expectNoSecret([thrown, ...events].map(errorText).join("\n"));
+  });
+});
+
+describe("errors that cannot be rewritten in place", () => {
+  /** Request one eth_call and return what was thrown and what `onEvent` saw. */
+  async function failure(options: HyperevmTransportOptions): Promise<{ thrown: unknown; events: Error[] }> {
+    const events: Error[] = [];
+    const client = open({
+      ...options,
+      verifyChainId: false,
+      retryCount: 0,
+      onEvent: (event) => {
+        if (event.type === "error") events.push(event.error);
+      },
+    });
+    const thrown = await client.request({ method: "eth_call", params: [] }).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    return { thrown, events };
+  }
+
+  test("a frozen fetch error is replaced with a scrubbed copy", async () => {
+    const { thrown, events } = await failure({
+      endpoints: [HYPERPC],
+      fetchFn: async () => {
+        throw Object.freeze(Object.assign(new TypeError(`failed ${HYPERPC}`), { code: "ECONNRESET" }));
+      },
+    });
+    expect(thrown).toBeInstanceOf(HttpRequestError);
+    const cause = (thrown as HttpRequestError).cause as TypeError & { code: string };
+    expect(cause).toBeInstanceOf(TypeError);
+    expect(cause.name).toBe("TypeError");
+    expect(cause.code).toBe("ECONNRESET");
+    expect(cause.message).toBe("failed https://hyperpc.example.test");
+    expect(events).toEqual([thrown as Error]);
+    expectNoSecret([thrown, ...events].map(errorText).join("\n"));
+  });
+
+  test("a DOMException's inherited message is scrubbed", async () => {
+    const { thrown, events } = await failure({
+      endpoints: [HYPERPC],
+      fetchFn: async () => {
+        throw new DOMException(`failed ${HYPERPC}`, "NetworkError");
+      },
+    });
+    const cause = (thrown as HttpRequestError).cause as DOMException;
+    expect(cause).toBeInstanceOf(DOMException);
+    expect(cause.name).toBe("NetworkError");
+    expect(cause.code).toBe(19);
+    expect(cause.message).toBe("failed https://hyperpc.example.test");
+    expectNoSecret([thrown, ...events].map(errorText).join("\n"));
+  });
+
+  test("a frozen error a transport throws as is is replaced up to the top", async () => {
+    const keyed: Transport = () =>
+      createTransport(
+        {
+          key: "keyed",
+          name: "keyed",
+          type: "test",
+          retryCount: 0,
+          request: (async () => {
+            const inner = Object.freeze(new Error(`socket to ${HYPERPC} closed`));
+            throw Object.freeze(new BaseError(`failed ${HYPERPC}`, { cause: inner }));
+          }) as EIP1193RequestFn,
+        },
+        { url: HYPERPC },
+      );
+    const { thrown, events } = await failure({ endpoints: [keyed] });
+    expect(thrown).toBeInstanceOf(BaseError);
+    expect((thrown as BaseError).shortMessage).toBe("failed https://hyperpc.example.test");
+    expect(((thrown as BaseError).cause as Error).message).toBe("socket to https://hyperpc.example.test closed");
+    expect(events).toEqual([thrown as Error]);
     expectNoSecret([thrown, ...events].map(errorText).join("\n"));
   });
 });

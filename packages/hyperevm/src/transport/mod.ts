@@ -709,37 +709,43 @@ export function hyperevm(options: HyperevmTransportOptions = {}): Transport<"hyp
         let wait = attempt > 0 ? retryDelay : 0;
         let mode = attempt === 0 ? routing : "best";
         let endpoint: RankedEndpoint | undefined;
-        for (let backedOff = false; ; ) {
-          // Waiting out a chain check is followed by a fresh pick. The last pick is synchronous, so
-          // `start()` counts it in flight before any other call picks.
-          // Failing over into an ejected endpoint amplifies an outage, and checking its chain costs up to a
-          // timeout during its cooldown. A new round goes back to the endpoints that failed once instead,
-          // and stops if only ejected ones are left. A first attempt still takes an ejected endpoint
-          // when every candidate is ejected.
-          let skipEjected = attempt > 0 && !backedOff;
-          let picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
-          while (picked instanceof Promise) {
-            skipEjected = (await picked) || skipEjected;
-            picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
+        for (;;) {
+          for (let backedOff = false; ; ) {
+            // Waiting out a chain check is followed by a fresh pick. The last pick is synchronous, so
+            // `start()` counts it in flight before any other call picks.
+            // Failing over into an ejected endpoint amplifies an outage, and checking its chain costs up to a
+            // timeout during its cooldown. A new round goes back to the endpoints that failed once instead,
+            // and stops if only ejected ones are left. A first attempt still takes an ejected endpoint
+            // when every candidate is ejected.
+            let skipEjected = attempt > 0 && !backedOff;
+            let picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
+            while (picked instanceof Promise) {
+              skipEjected = (await picked) || skipEjected;
+              picked = pickVerified(method, exclude, mode, parent, errors, skipEjected);
+            }
+            endpoint = picked;
+            if (endpoint || backedOff || exclude.size === 0) break;
+            // Every usable endpoint failed this call, or failed its chain check. Start another round after a backoff.
+            exclude.clear();
+            const candidate = board.pick(method, exclude, "best", random);
+            if (!candidate) break;
+            const ejectedMs = breaker.remaining(candidate.id);
+            if (ejectedMs > MAX_RETRY_BACKOFF_MS) break;
+            await delay(Math.max(backoffMs(round, retryBackoff, random), ejectedMs), parent);
+            round += 1;
+            wait = 0;
+            mode = "best";
+            backedOff = true;
           }
-          endpoint = picked;
-          if (endpoint || backedOff || exclude.size === 0) break;
-          // Every usable endpoint failed this call, or failed its chain check. Start another round after a backoff.
-          exclude.clear();
-          const candidate = board.pick(method, exclude, "best", random);
-          if (!candidate) break;
-          const ejectedMs = breaker.remaining(candidate.id);
-          if (ejectedMs > MAX_RETRY_BACKOFF_MS) break;
-          await delay(Math.max(backoffMs(round, retryBackoff, random), ejectedMs), parent);
-          round += 1;
+          if (!endpoint || wait === 0) break;
+          // A concurrent call may eject the pick while this one waits out `retryDelay`. Pick again if it did.
+          await delay(wait, parent);
           wait = 0;
-          mode = "best";
-          backedOff = true;
+          if (!breaker.isOpen(endpoint.id)) break;
         }
         if (!endpoint) break;
         exclude.add(endpoint.id);
         if (previous) emit({ type: "failover", from: previous.url, to: endpoint.url, method });
-        if (wait > 0) await delay(wait, parent);
         try {
           return await dispatch(endpoint, method, params, parent, idempotent, exclude);
         } catch (error: unknown) {
@@ -1163,58 +1169,129 @@ function redactErrors(
     try {
       return await request(args, options);
     } catch (error: unknown) {
-      if (typeof error === "string") throw scrub(error);
-      scrubError(error, scrub);
-      throw error;
+      throw scrubError(error, scrub);
     }
   };
 }
 
 /**
- * Scrub every string `error` holds, in place and at any depth: its own properties and cause, the plain objects
- * and arrays under them, and `Headers`. viem keeps the provider's JSON-RPC error, `data` included, as a plain-object
- * cause, and an HTTP error keeps the response headers. The walk keeps its own stack, so deep `data` cannot overflow.
+ * Scrub every string `error` holds at any depth, property names included: its own properties and cause, an inherited
+ * `message` or `stack` (a DOMException's), the plain objects and arrays under them, and `Headers`. viem keeps the
+ * provider's JSON-RPC error, `data` included, as a plain-object cause, and an HTTP error keeps the response headers.
+ *
+ * Fields are rewritten in place, so error classes and identity survive. A node that cannot be rewritten (frozen,
+ * read-only, or a getter) is replaced with a scrubbed copy on the same prototype, linked into its parents. A parent
+ * that cannot take it is replaced too, up to the top. Returns `error`, or its replacement. The walk keeps its own
+ * stack, so deep `data` cannot overflow.
  */
-function scrubError(error: unknown, scrub: (text: string) => string): void {
+function scrubError(error: unknown, scrub: (text: string) => string): unknown {
+  const root = scrubLeaf(error, scrub);
+  if (root !== error) return root;
   const seen = new WeakSet<object>();
+  const parents = new Map<object, { parent: object; key: string }[]>();
+  const stuck: object[] = [];
   const pending: unknown[] = [error];
   while (pending.length > 0) {
     const value = pending.pop();
-    if (typeof value !== "object" || value === null || seen.has(value)) continue;
-    if (!(value instanceof Error) && !Array.isArray(value) && !isPlainObject(value)) continue;
+    if (!isWalkable(value) || seen.has(value)) continue;
     seen.add(value);
-    const keys = value instanceof Error ? new Set([...Object.getOwnPropertyNames(value), "cause"]) : Object.keys(value);
-    for (const key of keys) {
+    let rewritten = true;
+    for (const key of keysOf(value)) {
       const item: unknown = Reflect.get(value, key);
-      if (typeof item === "string") {
-        const scrubbed = scrub(item);
-        if (scrubbed !== item) Reflect.set(value, key, scrubbed);
-      } else if (item instanceof Headers) {
-        const scrubbed = scrubHeaders(item, scrub);
-        if (scrubbed !== item) Reflect.set(value, key, scrubbed);
-      } else {
+      const scrubbed = scrubLeaf(item, scrub);
+      if (scrubbed !== item) {
+        if (!write(value, key, scrubbed)) rewritten = false;
+      } else if (isWalkable(item)) {
+        parents.set(item, [...(parents.get(item) ?? []), { parent: value, key }]);
         pending.push(item);
       }
     }
-    if (!Array.isArray(value)) scrubKeys(value, scrub);
+    if (!Array.isArray(value) && !scrubKeys(value, scrub)) rewritten = false;
+    if (!rewritten) stuck.push(value);
   }
+  const copies = new Map<object, object>();
+  const replace = (node: object): void => {
+    if (copies.has(node)) return;
+    const copy = scrubbedCopy(node, scrub, copies);
+    copies.set(node, copy);
+    // The parent's names were scrubbed in place or in its own copy, so the link lives under the scrubbed name.
+    for (const { parent, key } of parents.get(node) ?? []) {
+      if (!write(copies.get(parent) ?? parent, scrub(key), copy)) replace(parent);
+    }
+  };
+  for (const node of stuck) replace(node);
+  return isWalkable(error) ? (copies.get(error) ?? error) : error;
+}
+
+/** Errors, arrays, and plain objects. Other class instances are left alone. */
+function isWalkable(value: unknown): value is object {
+  if (typeof value !== "object" || value === null) return false;
+  return value instanceof Error || Array.isArray(value) || isPlainObject(value);
+}
+
+/** Properties to scrub. An error's `name`, `message`, `stack`, and `code` may be inherited, as on a DOMException. */
+function keysOf(value: object): Iterable<string> {
+  if (!(value instanceof Error)) return Object.keys(value);
+  const keys = new Set([...Object.getOwnPropertyNames(value), "name", "message", "stack", "cause"]);
+  if ("code" in value) keys.add("code");
+  return keys;
+}
+
+/** A scrubbed string, a scrubbed copy of `Headers`, or `item` itself. */
+function scrubLeaf(item: unknown, scrub: (text: string) => string): unknown {
+  if (typeof item === "string") return scrub(item);
+  if (item instanceof Headers) return scrubHeaders(item, scrub);
+  return item;
+}
+
+/** Set `key` and read it back. False when the object is frozen, the field is read-only, or a setter ignored it. */
+function write(target: object, key: string, value: unknown): boolean {
+  return Reflect.set(target, key, value) && Reflect.get(target, key) === value;
+}
+
+/** A writable copy of `node` on the same prototype, with scrubbed fields and names and any replaced children. */
+function scrubbedCopy(node: object, scrub: (text: string) => string, copies: ReadonlyMap<object, object>): object {
+  const clean = (item: unknown): unknown => {
+    const scrubbed = scrubLeaf(item, scrub);
+    return typeof scrubbed === "object" && scrubbed !== null ? (copies.get(scrubbed) ?? scrubbed) : scrubbed;
+  };
+  if (Array.isArray(node)) return Array.from(node, clean);
+  const copy: object = Object.create(Object.getPrototypeOf(node));
+  for (const key of keysOf(node)) {
+    const own = Object.getOwnPropertyDescriptor(node, key);
+    const item: unknown = Reflect.get(node, key);
+    if (item === undefined && !own) continue;
+    Object.defineProperty(copy, scrub(key), {
+      value: clean(item),
+      writable: true,
+      configurable: true,
+      enumerable: own?.enumerable ?? false,
+    });
+  }
+  return copy;
 }
 
 /**
  * Rename properties whose names hold a secret, in place. A gateway may key error data by URL.
- * A plain object has every property re-added, so its key order survives.
+ * A plain object has every property re-added, so its key order survives. False when the object cannot be changed.
  */
-function scrubKeys(value: object, scrub: (text: string) => string): void {
+function scrubKeys(value: object, scrub: (text: string) => string): boolean {
   const names = Object.getOwnPropertyNames(value);
-  if (names.every((name) => scrub(name) === name)) return;
+  if (names.every((name) => scrub(name) === name)) return true;
+  if (!Object.isExtensible(value)) return false;
   const keepOrder = !(value instanceof Error);
+  let renamed = true;
   for (const name of names) {
     const scrubbed = scrub(name);
     if (scrubbed === name && !keepOrder) continue;
     const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Reflect.deleteProperty(value, name)) continue;
-    Object.defineProperty(value, scrubbed, descriptor);
+    if (!descriptor || !Reflect.deleteProperty(value, name)) {
+      if (scrubbed !== name) renamed = false;
+      continue;
+    }
+    Reflect.defineProperty(value, scrubbed, descriptor);
   }
+  return renamed;
 }
 
 /** `headers`, or a scrubbed copy when a value held a secret. A response's headers are immutable, so they are replaced. */
