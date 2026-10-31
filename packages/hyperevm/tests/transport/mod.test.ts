@@ -39,6 +39,8 @@ function open(options: HyperevmTransportOptions) {
     routing: "best",
     retryCount: 2,
     hedge: false,
+    // These mocks answer every method alike. Chain checks have their own tests.
+    verifyChainId: false,
     ...options,
   })({ timeout: options.timeout ?? 1_000 });
 }

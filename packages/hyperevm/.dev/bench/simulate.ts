@@ -294,6 +294,7 @@ async function runHyperevm(
     random: mulberry32(0xdecaf),
     now: () => clock.value,
     score,
+    verifyChainId: false,
   })({ timeout: 10_000 });
   const value = client.value;
   if (!value) throw new Error("hyperevm transport is missing its value");
@@ -390,6 +391,7 @@ async function hedgePass(enabled: boolean): Promise<HedgeSeries> {
     routing: "best",
     hedge: enabled ? { minDelay: 40, multiplier: 2 } : false,
     retryCount: 1,
+    verifyChainId: false,
   })({ timeout: 2_000 });
   const samples: number[] = [];
   let errors = 0;

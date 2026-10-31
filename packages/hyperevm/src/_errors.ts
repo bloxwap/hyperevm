@@ -37,3 +37,21 @@ export class TimeoutError extends BaseError {
     this.timeoutMs = timeoutMs;
   }
 }
+
+/** Thrown when an endpoint reports another chain id. The transport stops calling that endpoint. */
+export class ChainMismatchError extends BaseError {
+  readonly endpoint: string;
+  readonly expected: number;
+  readonly chainId: number;
+
+  constructor(endpoint: string, expected: number, chainId: number) {
+    super("HyperEVM endpoint is on the wrong chain.", {
+      details: `${endpoint} reported chain id ${chainId}, expected ${expected}`,
+      name: "ChainMismatchError",
+    });
+    this.name = "ChainMismatchError";
+    this.endpoint = endpoint;
+    this.expected = expected;
+    this.chainId = chainId;
+  }
+}

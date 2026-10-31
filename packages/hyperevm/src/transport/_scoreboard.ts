@@ -135,7 +135,7 @@ export class Scoreboard {
     return scaled > minDelay ? scaled : minDelay;
   }
 
-  snapshot(method: string): EndpointSnapshot[] {
+  snapshot(method: string): Omit<EndpointSnapshot, "quarantined">[] {
     return this.#endpoints.map((endpoint) => ({
       id: endpoint.id,
       url: endpoint.url,
